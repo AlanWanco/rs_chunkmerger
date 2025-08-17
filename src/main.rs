@@ -1,64 +1,81 @@
-// 引入需要用到的标准库模块
-use std::fs::{File, OpenOptions};   // 处理文件读写
-use std::io::{self, Write, Read};    // 处理输入输出、读取和写入
-use walkdir::WalkDir;                // 用于遍历文件夹
-use std::env;                        // 获取当前目录
-use std::path::Path;                 // 处理路径相关
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, copy};
+use walkdir::WalkDir;
+use std::env;
+use natord::compare;
+use std::path::Path;
 
 fn main() -> io::Result<()> {
     // ----------------------------
-    // 1. 获取当前工作目录
+    // 1. 获取当前文件夹名
     // ----------------------------
-    let current_dir = env::current_dir()?; // 返回的是一个 PathBuf
-    // 从路径里取出文件夹名（最后一级）
+    let current_dir = env::current_dir()?;
     let folder_name = current_dir
-        .file_name()                    // 拿到文件夹名（OsStr 类型）
-        .and_then(|name| name.to_str()) // 转成 Rust &str
-        .unwrap_or("output");           // 如果失败就用 "output"
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
 
     // ----------------------------
-    // 2. 定义输出文件名：文件夹名 + ".ts"
+    // 2. 收集所有 .ts 文件
     // ----------------------------
-    let output_file = format!("{}.ts", folder_name);
-
-    // 创建/覆盖一个新的输出文件
-    let mut outfile = OpenOptions::new()
-        .create(true)   // 如果文件不存在就创建
-        .write(true)    // 打开写入权限
-        .truncate(true) // 如果文件已经存在就清空
-        .open(&output_file)?; // 可能失败，所以用 ?
+    let mut files: Vec<_> = WalkDir::new("./")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().map(|ext| ext == "ts").unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect();
 
     // ----------------------------
-    // 3. 遍历当前目录下所有文件
+    // 3. 自然排序
     // ----------------------------
-    for entry in WalkDir::new("./") {
-        let entry = entry?; // 每个 entry 是一个文件或文件夹
-        if entry.file_type().is_file() {
-            let path = entry.path(); // 获取路径
+    files.sort_by(|a, b| {
+        let sa = a.file_name().unwrap().to_string_lossy();
+        let sb = b.file_name().unwrap().to_string_lossy();
+        compare(&sa, &sb)
+    });
 
-            // 检查文件扩展名是不是 "ts"
-            if let Some(ext) = path.extension() {
-                if ext == "ts" {
-                    println!("正在合并 {:?}", path);
+    // ----------------------------
+    // 4. 获取首尾文件名
+    // ----------------------------
+    let start_name = files.first()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("start");
 
-                    // 打开输入文件
-                    let mut infile = File::open(path)?;
-                    let mut buffer = Vec::new();
+    let end_name = files.last()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("end");
 
-                    // 把文件内容读到 buffer 里
-                    infile.read_to_end(&mut buffer)?;
+    // ----------------------------
+    // 5. 构建输出路径 -> 上一级文件夹
+    // ----------------------------
+    let parent_dir = current_dir.parent().unwrap_or(Path::new("."));
+    let output_file = parent_dir.join(format!("{}[{}-{}].ts", folder_name, start_name, end_name));
 
-                    // 把内容写入输出文件
-                    outfile.write_all(&buffer)?;
-                }
-            }
-        }
+    let mut outfile = BufWriter::new(
+        OpenOptions::new().create(true).write(true).truncate(true).open(&output_file)?
+    );
+
+    // ----------------------------
+    // 6. 按顺序合并
+    // ----------------------------
+    for path in &files {
+        println!("Merging {:?}", path);
+        let infile = File::open(path)?;
+        let mut reader = BufReader::new(infile);
+        copy(&mut reader, &mut outfile)?;
     }
 
+    println!("✅ Merge finished -> {:?}", output_file);
+
     // ----------------------------
-    // 4. 合并完成提示
+    // 7. 按回车继续
     // ----------------------------
-    println!("✅ 合并完成，输出文件：{}", output_file);
+    println!("按回车键退出...");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
 
     Ok(())
 }

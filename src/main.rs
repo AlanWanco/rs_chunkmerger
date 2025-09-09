@@ -4,6 +4,7 @@ use walkdir::WalkDir;
 use std::env;
 use natord::compare;
 use std::path::Path;
+use std::process::Command;
 
 fn main() -> io::Result<()> {
     // ----------------------------
@@ -71,11 +72,62 @@ fn main() -> io::Result<()> {
     println!("✅ Merge finished -> {:?}", output_file);
 
     // ----------------------------
-    // 7. 按回车继续
+    // 7. 检查 ffmpeg 并转换为 mp4
+    // ----------------------------
+    let ffmpeg_path = which_ffmpeg();
+    match ffmpeg_path {
+        Some(ffmpeg) => {
+            let mp4_path = output_file.with_extension("mp4");
+            println!("正在调用 ffmpeg 转换为 mp4...");
+            let status = Command::new(ffmpeg)
+                .args([
+                    "-y", // 覆盖输出
+                    "-i", output_file.to_str().unwrap(),
+                    "-c", "copy",
+                    mp4_path.to_str().unwrap(),
+                ])
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    println!("✅ 转换完成: {:?}", mp4_path);
+                }
+                Ok(s) => {
+                    println!("❌ ffmpeg 运行失败，退出码: {}", s);
+                    println!("输出 ts 文件: {:?}", output_file);
+                }
+                Err(e) => {
+                    println!("❌ 调用 ffmpeg 失败: {}", e);
+                    println!("输出 ts 文件: {:?}", output_file);
+                }
+            }
+        }
+        None => {
+            println!("❌ 未找到 ffmpeg，请将 ffmpeg 添加到系统 PATH 或放在当前目录下。");
+            println!("输出 ts 文件: {:?}", output_file);
+        }
+    }
+
+    // ----------------------------
+    // 8. 按回车继续
     // ----------------------------
     println!("按回车键退出...");
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
 
     Ok(())
+}
+
+/// 检查 ffmpeg 是否可用，优先系统 PATH，其次当前目录
+fn which_ffmpeg() -> Option<String> {
+    // 1. 检查系统 PATH
+    if let Ok(ffmpeg_in_path) = which::which("ffmpeg") {
+        return Some(ffmpeg_in_path.to_string_lossy().to_string());
+    }
+    // 2. 检查当前目录下的 ffmpeg.exe
+    let local_ffmpeg = Path::new("./ffmpeg.exe");
+    if local_ffmpeg.exists() {
+        return Some(local_ffmpeg.to_string_lossy().to_string());
+    }
+    None
 }

@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 walkdir = "2"
 natord = "1"
+which = "5"
+
+[build-dependencies]
+winres = "0.1"

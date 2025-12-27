@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, remove_file};
 use std::io::{self, BufReader, BufWriter, copy};
 use walkdir::WalkDir;
 use std::env;
@@ -17,13 +17,22 @@ fn main() -> io::Result<()> {
         .unwrap_or("output");
 
     // ----------------------------
-    // 2. 收集所有 .ts 文件
+    // 2. 收集支持的文件类型
+    //    支持: ts, decrypt, mp4, m4s
     // ----------------------------
+    let supported_exts = ["ts", "decrypt", "mp4", "m4s"];
+
     let mut files: Vec<_> = WalkDir::new("./")
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map(|ext| ext == "ts").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|s| supported_exts.iter().any(|t| t.eq_ignore_ascii_case(s)))
+                .unwrap_or(false)
+        })
         .map(|e| e.into_path())
         .collect();
 
@@ -91,6 +100,18 @@ fn main() -> io::Result<()> {
             match status {
                 Ok(s) if s.success() => {
                     println!("✅ 转换完成: {:?}", mp4_path);
+
+                    // 尝试删除旧的输出文件（例如 .ts），若删除失败则给出相应提示
+                    match remove_file(&output_file) {
+                        Ok(_) => println!("✅ 已删除旧文件: {:?}", output_file),
+                        Err(e) => {
+                            if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) {
+                                println!("❌ 无法删除旧文件，文件被占用: {:?}", output_file);
+                            } else {
+                                println!("❌ 删除旧文件失败: {}，文件: {:?}", e, output_file);
+                            }
+                        }
+                    }
                 }
                 Ok(s) => {
                     println!("❌ ffmpeg 运行失败，退出码: {}", s);

@@ -16,6 +16,9 @@ fn main() -> io::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("output");
 
+    // 编译时包版本，用于输出文件名区分
+    let version = env!("CARGO_PKG_VERSION");
+
     // ----------------------------
     // 2. 收集支持的文件类型
     //    支持: ts, decrypt, mp4, m4s
@@ -78,7 +81,7 @@ fn main() -> io::Result<()> {
     // 5. 构建输出路径 -> 上一级文件夹
     // ----------------------------
     let parent_dir = current_dir.parent().unwrap_or(Path::new("."));
-    let output_file = parent_dir.join(format!("{}[{}-{}].ts", folder_name, start_name, end_name));
+    let output_file = parent_dir.join(format!("{}[v{}][{}-{}].ts", folder_name, version, start_name, end_name));
 
     let mut outfile = BufWriter::new(
         OpenOptions::new().create(true).write(true).truncate(true).open(&output_file)?

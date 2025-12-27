@@ -46,6 +46,22 @@ fn main() -> io::Result<()> {
     });
 
     // ----------------------------
+    // MPD 特殊处理：若存在文件名包含 "init" 的支持文件，
+    // 则将第一个匹配的 init 文件移动到合并列表的首位
+    // ----------------------------
+    if let Some(pos) = files.iter().position(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_lowercase().contains("init"))
+            .unwrap_or(false)
+    }) {
+        if pos != 0 {
+            let init_path = files.remove(pos);
+            files.insert(0, init_path);
+        }
+    }
+
+    // ----------------------------
     // 4. 获取首尾文件名
     // ----------------------------
     let start_name = files.first()

@@ -20,6 +20,13 @@ fn main() -> io::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
 
     // ----------------------------
+    // 额外命令行选项
+    //    --ts : 生成 .ts 并跳过 ffmpeg 转换为 mp4
+    // ----------------------------
+    let args: Vec<String> = env::args().collect();
+    let skip_ffmpeg = args.iter().any(|a| a == "--ts");
+
+    // ----------------------------
     // 2. 收集支持的文件类型
     //    支持: ts, decrypt, mp4, m4s
     // ----------------------------
@@ -100,51 +107,55 @@ fn main() -> io::Result<()> {
     println!("✅ Merge finished -> {:?}", output_file);
 
     // ----------------------------
-    // 7. 检查 ffmpeg 并转换为 mp4
+    // 7. 根据参数决定是否使用 ffmpeg 转换为 mp4
     // ----------------------------
-    let ffmpeg_path = which_ffmpeg();
-    match ffmpeg_path {
-        Some(ffmpeg) => {
-            let mp4_path = output_file.with_extension("mp4");
-            println!("正在调用 ffmpeg 转换为 mp4...");
-            let status = Command::new(ffmpeg)
-                .args([
-                    "-y", // 覆盖输出
-                    "-i", output_file.to_str().unwrap(),
-                    "-c", "copy",
-                    mp4_path.to_str().unwrap(),
-                ])
-                .status();
+    if skip_ffmpeg {
+        println!("已指定 --ts，跳过 ffmpeg 转换，保留 ts 文件: {:?}", output_file);
+    } else {
+        let ffmpeg_path = which_ffmpeg();
+        match ffmpeg_path {
+            Some(ffmpeg) => {
+                let mp4_path = output_file.with_extension("mp4");
+                println!("正在调用 ffmpeg 转换为 mp4...");
+                let status = Command::new(ffmpeg)
+                    .args([
+                        "-y", // 覆盖输出
+                        "-i", output_file.to_str().unwrap(),
+                        "-c", "copy",
+                        mp4_path.to_str().unwrap(),
+                    ])
+                    .status();
 
-            match status {
-                Ok(s) if s.success() => {
-                    println!("✅ 转换完成: {:?}", mp4_path);
+                match status {
+                    Ok(s) if s.success() => {
+                        println!("✅ 转换完成: {:?}", mp4_path);
 
-                    // 尝试删除旧的输出文件（例如 .ts），若删除失败则给出相应提示
-                    match remove_file(&output_file) {
-                        Ok(_) => println!("✅ 已删除旧文件: {:?}", output_file),
-                        Err(e) => {
-                            if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) {
-                                println!("❌ 无法删除旧文件，文件被占用: {:?}", output_file);
-                            } else {
-                                println!("❌ 删除旧文件失败: {}，文件: {:?}", e, output_file);
+                        // 尝试删除旧的输出文件（例如 .ts），若删除失败则给出相应提示
+                        match remove_file(&output_file) {
+                            Ok(_) => println!("✅ 已删除旧文件: {:?}", output_file),
+                            Err(e) => {
+                                if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) {
+                                    println!("❌ 无法删除旧文件，文件被占用: {:?}", output_file);
+                                } else {
+                                    println!("❌ 删除旧文件失败: {}，文件: {:?}", e, output_file);
+                                }
                             }
                         }
                     }
-                }
-                Ok(s) => {
-                    println!("❌ ffmpeg 运行失败，退出码: {}", s);
-                    println!("输出 ts 文件: {:?}", output_file);
-                }
-                Err(e) => {
-                    println!("❌ 调用 ffmpeg 失败: {}", e);
-                    println!("输出 ts 文件: {:?}", output_file);
+                    Ok(s) => {
+                        println!("❌ ffmpeg 运行失败，退出码: {}", s);
+                        println!("输出 ts 文件: {:?}", output_file);
+                    }
+                    Err(e) => {
+                        println!("❌ 调用 ffmpeg 失败: {}", e);
+                        println!("输出 ts 文件: {:?}", output_file);
+                    }
                 }
             }
-        }
-        None => {
-            println!("❌ 未找到 ffmpeg，请将 ffmpeg 添加到系统 PATH 或放在当前目录下。");
-            println!("输出 ts 文件: {:?}", output_file);
+            None => {
+                println!("❌ 未找到 ffmpeg，请将 ffmpeg 添加到系统 PATH 或放在当前目录下。");
+                println!("输出 ts 文件: {:?}", output_file);
+            }
         }
     }
 

@@ -76,7 +76,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rs_merseg"
+name = "rs_chunkmerger"
 version = "0.2.2"
 dependencies = [
  "natord",

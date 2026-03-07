@@ -38,6 +38,6 @@ cargo build --release
 - **FFmpeg**：若需自动转换为 MP4，请确保 `ffmpeg` 已添加到系统 PATH 中，或将 `ffmpeg.exe` 放在程序同级目录下。
 - **文件命名**：输出文件名将结合当前文件夹名、版本号以及分片的起始/结束编号。
 
-## 执照
+## 许可证
 
-[MIT](LICENSE) (或者根据你的实际情况修改)
+[Apache-2.0](LICENSE)

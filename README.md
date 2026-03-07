@@ -1,6 +1,7 @@
 # rs_chunkmerger
 
 一个用 Rust 编写的高效媒体分片合并工具，支持自动排序、DASH/HLS 分片处理及可选的 FFmpeg 转码。
+
 ~~其实就是给minyami、N_m3u8DL-RE这些工具报错后处理现有切片啦~~
 
 ## 功能特性

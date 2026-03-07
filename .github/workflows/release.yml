@@ -1,0 +1,81 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: rs_chunkmerger-windows-amd64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: rs_chunkmerger-macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: rs_chunkmerger-linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: rs_chunkmerger-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          target: ${{ matrix.target }}
+          args: "--release"
+          strip: true
+
+      - name: Rename artifact
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            mv target/${{ matrix.target }}/release/rs_chunkmerger.exe ${{ matrix.artifact_name }}
+          else
+            mv target/${{ matrix.target }}/release/rs_chunkmerger ${{ matrix.artifact_name }}
+          fi
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.target }}
+          path: ${{ matrix.artifact_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifact-*
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rs_chunkmerger-windows-amd64.exe
+            rs_chunkmerger-macos-arm64
+            rs_chunkmerger-linux-amd64
+            rs_chunkmerger-linux-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

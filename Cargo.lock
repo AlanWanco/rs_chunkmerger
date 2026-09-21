@@ -79,6 +79,7 @@ dependencies = [
 name = "rs_chunkmerger"
 version = "0.2.2"
 dependencies = [
+ "libc",
  "natord",
  "walkdir",
  "which",

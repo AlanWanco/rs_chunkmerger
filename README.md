@@ -10,6 +10,8 @@
 - **智能排序**：采用自然排序（Natural Sort），确保分片按 `1, 2, 10` 而非 `1, 10, 2` 的顺序合并。
 - **DASH 支持**：自动识别并优先放置包含 `init` 字样的初始化文件。
 - **自动转码**：合并完成后可自动调用 FFmpeg 将 TS 转换为 MP4（需系统已安装 FFmpeg）。
+- **跨平台支持**：支持 Windows、Linux 和 macOS（Apple Silicon/Intel）。
+- **隐藏文件过滤**：默认跳过隐藏文件、dotfile 和 macOS 隐藏目录；需要时可使用 `--include-hidden` 包含。
 - **简单易用**：直接在包含分片的文件夹中运行即可，输出文件会自动存放在上级目录。
 
 ## 安装说明
@@ -34,10 +36,14 @@ cargo build --release
    ```bash
    rs_chunkmerger --ts
    ```
+4. 默认不会合并隐藏文件和 dotfile；如需包含这些文件，可以运行：
+   ```bash
+   rs_chunkmerger --include-hidden
+   ```
 
 ## 注意事项
 
-- **FFmpeg**：若需自动转换为 MP4，请确保 `ffmpeg` 已添加到系统 PATH 中，或将 `ffmpeg.exe` 放在程序同级目录下。
+- **FFmpeg**：若需自动转换为 MP4，请确保 `ffmpeg` 已添加到系统 PATH 中，或将本地 `ffmpeg`/`ffmpeg.exe` 放在程序同级目录下。
 - **文件命名**：输出文件名将结合当前文件夹名、版本号以及分片的起始/结束编号。
 
 ## 现有问题

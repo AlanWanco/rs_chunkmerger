@@ -16,7 +16,7 @@ fn main() -> io::Result<()> {
     let input_dir = resolve_input_dir(&current_dir, options.input_dir.as_deref())?;
     let version = env!("CARGO_PKG_VERSION");
 
-    println!("扫描目录: {:?}", input_dir);
+    println!("扫描目录: {}", compact_path(&input_dir, 80));
     if !options.include_hidden {
         println!("默认跳过隐藏文件和 dotfile（如需包含请使用 --include-hidden）");
     }
@@ -43,7 +43,8 @@ fn main() -> io::Result<()> {
 
     let mut plans = Vec::new();
     for (directory, candidates) in directories {
-        println!("\n=== 目录组：{:?} ===", directory);
+        let label = directory_label(&input_dir, &directory);
+        println!("\n=== 目录组：{} ===", compact_text(&label, 72));
         let inspection = inspect_candidate_files(&directory, candidates)?;
         print_inspection(&inspection);
         if inspection.files.is_empty() {
@@ -60,7 +61,7 @@ fn main() -> io::Result<()> {
         let output_files = build_output_paths(&input_dir, &directory, version, &groups);
         print_merge_plan(&groups, &output_files);
         plans.push(DirectoryPlan {
-            directory,
+            label,
             inspection,
             groups,
             output_files,
@@ -85,26 +86,35 @@ fn main() -> io::Result<()> {
         let irregular_names = !irregular_filename_samples(&plan.inspection).is_empty();
         let prompt = if irregular_names {
             format!(
-                "⚠️ {:?} 文件名规律不足，可能选错目录；仍合并这 {} 个文件？ [y/N]",
-                plan.directory,
+                "⚠️ 目录组「{}」文件名规律不足，可能选错目录；仍合并这 {} 个文件？ [y/N]",
+                compact_text(&plan.label, 48),
                 plan.inspection.files.len()
             )
         } else {
             format!(
-                "确认目录 {:?} 的文件范围和数量（{} 个），开始合并？ [y/N]",
-                plan.directory,
+                "确认目录组「{}」的文件范围和数量（{} 个），开始合并？ [y/N]",
+                compact_text(&plan.label, 48),
                 plan.inspection.files.len()
             )
         };
         if !ask_yes_no(&prompt)? {
-            println!("已跳过目录 {:?}。", plan.directory);
+            println!("已跳过目录组「{}」。", compact_text(&plan.label, 48));
             continue;
         }
 
         for (index, (group, output_file)) in plan.groups.iter().zip(&plan.output_files).enumerate()
         {
             merge_files(group, output_file)?;
-            println!("✅ 合并完成: {:?}", output_file);
+            println!(
+                "✅ 合并完成: {}",
+                compact_text(
+                    &output_file
+                        .file_name()
+                        .unwrap_or(output_file.as_os_str())
+                        .to_string_lossy(),
+                    88,
+                )
+            );
 
             if options.skip_ffmpeg {
                 println!("已指定 --ts，跳过 ffmpeg 转换。");
@@ -168,7 +178,7 @@ fn resolve_input_dir(current_dir: &Path, input_dir: Option<&Path>) -> io::Result
     if !input_dir.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("输入路径不是目录: {:?}", input_dir),
+            format!("输入路径不是目录: {}", compact_path(&input_dir, 80)),
         ));
     }
 
@@ -206,7 +216,7 @@ struct Inspection {
 }
 
 struct DirectoryPlan {
-    directory: PathBuf,
+    label: String,
     inspection: Inspection,
     groups: Vec<Vec<MediaFile>>,
     output_files: Vec<PathBuf>,
@@ -244,7 +254,7 @@ fn print_unscanned_subdirectories(root: &Path, include_hidden: bool) {
         directories.len()
     );
     for directory in directories.iter().take(10) {
-        println!("  - {:?}", directory);
+        println!("  - {}", file_name_display(directory));
     }
     if directories.len() > 10 {
         println!("  …另有 {} 个子目录。", directories.len() - 10);
@@ -267,7 +277,7 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
         let metadata = match path.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
-                warnings.push(format!("无法读取 {:?}: {error}", path));
+                warnings.push(format!("无法读取 {}: {error}", compact_path(&path, 72)));
                 continue;
             }
         };
@@ -285,14 +295,17 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
             if size % layout.stride as u64 != 0 {
                 let (checked_packets, invalid_syncs) = inspect_ts_packets(&path, size, layout)?;
                 warnings.push(format!(
-                    "TS 大小异常：{:?} 为 {} 字节（包长 {}），检查了 {} 个二进制包，发现 {} 个同步字节异常。",
-                    path, size, layout.stride, checked_packets, invalid_syncs
+                    "TS 大小异常：{} 为 {} 字节（包长 {}），检查了 {} 个二进制包，发现 {} 个同步字节异常。",
+                    file_name_display(&path), size, layout.stride, checked_packets, invalid_syncs
                 ));
             }
         }
 
         if size == 0 {
-            warnings.push(format!("空文件仍在待合并范围内：{:?}", path));
+            warnings.push(format!(
+                "空文件仍在待合并范围内：{}",
+                file_name_display(&path)
+            ));
         }
 
         let (sequence, series_key) = sequence_details(root, &path);
@@ -446,13 +459,17 @@ fn remove_identical_duplicates(
 
         if let Some(existing_path) = identical_to {
             warnings.push(format!(
-                "相同编号且二进制内容完全一致，跳过重复文件：{:?} == {:?}",
-                file.path, existing_path
+                "相同编号且二进制内容完全一致，跳过重复文件：{} == {}",
+                file_name_display(&file.path),
+                file_name_display(&existing_path)
             ));
             continue;
         }
         if has_conflict {
-            warnings.push(format!("编号重复但二进制内容不同，请检查：{:?}", file.path));
+            warnings.push(format!(
+                "编号重复但二进制内容不同，请检查：{}",
+                file_name_display(&file.path)
+            ));
         }
         kept.push(file);
     }
@@ -539,7 +556,11 @@ fn print_inspection(inspection: &Inspection) {
         inspection.skipped_typescript.len()
     );
     if let (Some(first), Some(last)) = (inspection.files.first(), inspection.files.last()) {
-        println!("文件范围：{:?} → {:?}", first.path, last.path);
+        println!(
+            "文件范围：{} → {}",
+            file_name_display(&first.path),
+            file_name_display(&last.path)
+        );
     }
     if inspection.duplicate_count > 0 {
         println!(
@@ -550,7 +571,7 @@ fn print_inspection(inspection: &Inspection) {
     if !inspection.skipped_typescript.is_empty() {
         println!("已跳过文本/非 MPEG-TS .ts 文件（TypeScript 源码不会参与合并）：");
         for path in inspection.skipped_typescript.iter().take(10) {
-            println!("  - {:?}", path);
+            println!("  - {}", file_name_display(path));
         }
         if inspection.skipped_typescript.len() > 10 {
             println!("  …另有 {} 个。", inspection.skipped_typescript.len() - 10);
@@ -563,7 +584,7 @@ fn print_inspection(inspection: &Inspection) {
     if !irregular_samples.is_empty() {
         println!("⚠️ 文件名规律不足，可能选错目录；这些文件无法归入至少包含两片的编号序列：");
         for path in irregular_samples.iter().take(8) {
-            println!("  - {:?}", path);
+            println!("  - {}", file_name_display(path));
         }
         if irregular_samples.len() > 8 {
             println!("  …另有 {} 个文件。", irregular_samples.len() - 8);
@@ -599,13 +620,18 @@ fn print_inspection(inspection: &Inspection) {
         for gap in &inspection.gaps {
             if gap.missing_start == gap.missing_end {
                 println!(
-                    "  - {}：缺少 {}（下一片：{:?}）",
-                    gap.series_key, gap.missing_start, gap.next_file
+                    "  - {}：缺少 {}（下一片：{}）",
+                    display_series_key(&gap.series_key),
+                    gap.missing_start,
+                    file_name_display(&gap.next_file)
                 );
             } else {
                 println!(
-                    "  - {}：缺少 {}-{}（下一片：{:?}）",
-                    gap.series_key, gap.missing_start, gap.missing_end, gap.next_file
+                    "  - {}：缺少 {}-{}（下一片：{}）",
+                    display_series_key(&gap.series_key),
+                    gap.missing_start,
+                    gap.missing_end,
+                    file_name_display(&gap.next_file)
                 );
             }
         }
@@ -718,12 +744,21 @@ fn build_output_paths(
 
 fn print_merge_plan(groups: &[Vec<MediaFile>], output_files: &[PathBuf]) {
     println!("合并计划：共 {} 个输出视频。", groups.len());
+    if let Some(output_dir) = output_files.first().and_then(|path| path.parent()) {
+        println!("输出目录：{}", compact_path(output_dir, 80));
+    }
     for (index, (group, output)) in groups.iter().zip(output_files).enumerate() {
         let bytes: u64 = group.iter().map(|file| file.size).sum();
-        let first = group.first().map(|file| &file.path);
-        let last = group.last().map(|file| &file.path);
+        let first = group
+            .first()
+            .map(|file| file_name_display(&file.path))
+            .unwrap_or_else(|| "start".to_string());
+        let last = group
+            .last()
+            .map(|file| file_name_display(&file.path))
+            .unwrap_or_else(|| "end".to_string());
         println!(
-            "  {}. {} 个文件，{}，范围 {:?} → {:?}",
+            "  {}. {} 个文件，{}，范围 {} → {}",
             index + 1,
             group.len(),
             format_bytes(bytes),
@@ -731,8 +766,8 @@ fn print_merge_plan(groups: &[Vec<MediaFile>], output_files: &[PathBuf]) {
             last
         );
         println!(
-            "     输出：{:?}{}",
-            output,
+            "     输出：{}{}",
+            compact_text(&file_name_display(output), 88),
             if output.exists() {
                 "（将覆盖已有文件）"
             } else {
@@ -740,6 +775,49 @@ fn print_merge_plan(groups: &[Vec<MediaFile>], output_files: &[PathBuf]) {
             }
         );
     }
+}
+
+fn directory_label(scan_root: &Path, directory: &Path) -> String {
+    let relative = directory.strip_prefix(scan_root).unwrap_or(directory);
+    if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.display().to_string()
+    }
+}
+
+fn file_name_display(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn compact_path(path: &Path, max_chars: usize) -> String {
+    let displayed = path.display().to_string();
+    let displayed = displayed.strip_prefix("\\\\?\\").unwrap_or(&displayed);
+    compact_text(displayed, max_chars)
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(2);
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let suffix: String = text
+        .chars()
+        .rev()
+        .take(max_chars - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{suffix}")
+}
+
+fn display_series_key(series_key: &str) -> &str {
+    series_key.strip_prefix("::").unwrap_or(series_key)
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -772,8 +850,15 @@ fn merge_files(files: &[MediaFile], output_file: &Path) -> io::Result<()> {
             .truncate(true)
             .open(output_file)?,
     );
-    for file in files {
-        println!("Merging {:?}", file.path);
+    for (index, file) in files.iter().enumerate() {
+        if files.len() <= 20 || index == 0 || (index + 1) % 100 == 0 || index + 1 == files.len() {
+            println!(
+                "合并进度 {}/{}：{}",
+                index + 1,
+                files.len(),
+                compact_text(&file_name_display(&file.path), 64)
+            );
+        }
         let mut reader = BufReader::new(File::open(&file.path)?);
         copy(&mut reader, &mut outfile)?;
     }
@@ -794,19 +879,22 @@ fn convert_to_mp4(ffmpeg: &Path, output_file: &Path) {
 
     match status {
         Ok(status) if status.success() => {
-            println!("✅ 转换完成: {:?}", mp4_path);
+            println!(
+                "✅ 转换完成: {}",
+                compact_text(&file_name_display(&mp4_path), 88)
+            );
             match remove_file(output_file) {
-                Ok(()) => println!("✅ 已删除旧文件: {:?}", output_file),
-                Err(error) => println!("❌ 删除旧文件失败: {error}，文件: {:?}", output_file),
+                Ok(()) => println!("✅ 已删除旧 TS 文件。"),
+                Err(error) => println!("❌ 删除旧 TS 文件失败: {error}"),
             }
         }
         Ok(status) => println!(
-            "❌ ffmpeg 运行失败，退出码: {status}；保留 TS 文件: {:?}",
-            output_file
+            "❌ ffmpeg 运行失败，退出码: {status}；保留 TS 文件: {}",
+            compact_text(&file_name_display(output_file), 88)
         ),
         Err(error) => println!(
-            "❌ 调用 ffmpeg 失败: {error}；保留 TS 文件: {:?}",
-            output_file
+            "❌ 调用 ffmpeg 失败: {error}；保留 TS 文件: {}",
+            compact_text(&file_name_display(output_file), 88)
         ),
     }
 }
@@ -894,9 +982,10 @@ fn which_ffmpeg() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_merge_groups, build_output_paths, collect_media_files, compare_media_files,
-        group_candidates_by_directory, inspect_candidate_files, inspect_media_files,
-        irregular_filename_samples, is_dotfile, parse_args, resolve_input_dir,
+        build_merge_groups, build_output_paths, collect_media_files, compact_text,
+        compare_media_files, file_name_display, group_candidates_by_directory,
+        inspect_candidate_files, inspect_media_files, irregular_filename_samples, is_dotfile,
+        parse_args, resolve_input_dir,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -910,6 +999,17 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn formats_console_labels_without_debug_paths() {
+        assert_eq!(
+            file_name_display(Path::new("segment001.ts")),
+            "segment001.ts"
+        );
+        let compact = compact_text("a very long path component for terminal output", 20);
+        assert!(compact.starts_with('…'));
+        assert_eq!(compact.chars().count(), 20);
     }
 
     #[test]

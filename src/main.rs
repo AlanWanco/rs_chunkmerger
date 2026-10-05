@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, remove_file};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 
 use natord::compare;
 use walkdir::{DirEntry, WalkDir};
@@ -41,6 +42,8 @@ fn main() -> io::Result<()> {
         candidate_count
     );
 
+    let ffmpeg = which_ffmpeg();
+    let ffprobe = which_ffprobe();
     let mut plans = Vec::new();
     for (directory, candidates) in directories {
         let label = directory_label(&input_dir, &directory);
@@ -52,78 +55,120 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let split_at_gaps = if inspection.gaps.is_empty() {
-            false
-        } else {
-            ask_yes_no("是否在缺片处拆分成多个视频？ [y/N]")?
-        };
-        let groups = build_merge_groups(&inspection.files, &inspection.gaps, split_at_gaps);
-        let output_files = build_output_paths(&input_dir, &directory, version, &groups);
-        print_merge_plan(&groups, &output_files);
-        plans.push(DirectoryPlan {
-            label,
-            inspection,
-            groups,
-            output_files,
-        });
+        match assess_audio_video_tracks(&inspection, ffprobe.as_deref()) {
+            AvAssessment::Pair(pair) => {
+                if ffmpeg.is_none() {
+                    println!("⚠️ 已识别独立音视频轨，但未找到 ffmpeg；不会将两轨直接拼接。");
+                    continue;
+                }
+                let groups = vec![inspection.files.clone()];
+                let mut output_file = build_output_paths(&input_dir, &directory, version, &groups)
+                    .into_iter()
+                    .next()
+                    .expect("one output path for one AV pair");
+                if !options.skip_ffmpeg {
+                    output_file.set_extension("mp4");
+                }
+                print_audio_video_plan(&pair, &output_file);
+                plans.push(DirectoryPlan {
+                    label,
+                    inspection,
+                    action: DirectoryAction::MuxTracks { pair, output_file },
+                });
+            }
+            AvAssessment::Unsafe(reason) => {
+                println!("⚠️ {reason}");
+            }
+            AvAssessment::SingleProgram => {
+                let split_at_gaps = if inspection.gaps.is_empty() {
+                    false
+                } else {
+                    ask_yes_no("是否在缺片处拆分成多个视频？ [y/N]")?
+                };
+                let groups = build_merge_groups(&inspection.files, &inspection.gaps, split_at_gaps);
+                let output_files = build_output_paths(&input_dir, &directory, version, &groups);
+                print_merge_plan(&groups, &output_files);
+                plans.push(DirectoryPlan {
+                    label,
+                    inspection,
+                    action: DirectoryAction::Concatenate {
+                        groups,
+                        output_files,
+                    },
+                });
+            }
+        }
     }
 
     if plans.is_empty() {
         println!("没有可执行的合并任务。");
         return Ok(());
     }
-
-    let ffmpeg = if options.skip_ffmpeg {
-        None
-    } else {
-        which_ffmpeg()
-    };
     if !options.skip_ffmpeg && ffmpeg.is_none() {
-        println!("未找到 ffmpeg；合并后将保留 TS 文件。");
+        println!("未找到 ffmpeg；普通分片合并后将保留 TS 文件。");
     }
 
     for plan in plans {
         let irregular_names = !irregular_filename_samples(&plan.inspection).is_empty();
-        let prompt = if irregular_names {
-            format!(
+        let prompt = match &plan.action {
+            DirectoryAction::Concatenate { .. } if irregular_names => format!(
                 "⚠️ 目录组「{}」文件名规律不足，可能选错目录；仍合并这 {} 个文件？ [y/N]",
                 compact_text(&plan.label, 48),
                 plan.inspection.files.len()
-            )
-        } else {
-            format!(
+            ),
+            DirectoryAction::Concatenate { .. } => format!(
                 "确认目录组「{}」的文件范围和数量（{} 个），开始合并？ [y/N]",
                 compact_text(&plan.label, 48),
                 plan.inspection.files.len()
-            )
+            ),
+            DirectoryAction::MuxTracks { pair, .. } => format!(
+                "确认目录组「{}」的音视频轨时间线对齐；复用 {} 个视频片段与 {} 个音频片段？ [y/N]",
+                compact_text(&plan.label, 40),
+                pair.video.files.len(),
+                pair.audio.files.len()
+            ),
         };
         if !ask_yes_no(&prompt)? {
             println!("已跳过目录组「{}」。", compact_text(&plan.label, 48));
             continue;
         }
 
-        for (index, (group, output_file)) in plan.groups.iter().zip(&plan.output_files).enumerate()
-        {
-            merge_files(group, output_file)?;
-            println!(
-                "✅ 合并完成: {}",
-                compact_text(
-                    &output_file
-                        .file_name()
-                        .unwrap_or(output_file.as_os_str())
-                        .to_string_lossy(),
-                    88,
-                )
-            );
-
-            if options.skip_ffmpeg {
-                println!("已指定 --ts，跳过 ffmpeg 转换。");
-            } else if let Some(ffmpeg) = &ffmpeg {
-                convert_to_mp4(ffmpeg, output_file);
+        match plan.action {
+            DirectoryAction::Concatenate {
+                groups,
+                output_files,
+            } => {
+                for (index, (group, output_file)) in groups.iter().zip(&output_files).enumerate() {
+                    merge_files(group, output_file)?;
+                    println!(
+                        "✅ 合并完成: {}",
+                        compact_text(&file_name_display(output_file), 88)
+                    );
+                    if options.skip_ffmpeg {
+                        println!("已指定 --ts，跳过 ffmpeg 转换。");
+                    } else if let Some(ffmpeg) = &ffmpeg {
+                        convert_to_mp4(ffmpeg, output_file);
+                    }
+                    if index + 1 < groups.len() {
+                        println!("完成分段 {}/{}。", index + 1, groups.len());
+                    }
+                }
             }
-
-            if index + 1 < plan.groups.len() {
-                println!("完成分段 {}/{}。", index + 1, plan.groups.len());
+            DirectoryAction::MuxTracks { pair, output_file } => {
+                match (ffmpeg.as_deref(), ffprobe.as_deref()) {
+                    (Some(ffmpeg), Some(ffprobe)) => {
+                        if let Err(error) = mux_audio_video(
+                            ffmpeg,
+                            ffprobe,
+                            &pair,
+                            &output_file,
+                            options.skip_ffmpeg,
+                        ) {
+                            println!("❌ 音视频复用失败，未发布输出文件：{error}");
+                        }
+                    }
+                    _ => println!("❌ ffmpeg/ffprobe 不可用；不会将音视频轨直接拼接。"),
+                }
             }
         }
     }
@@ -197,6 +242,7 @@ struct MediaFile {
     size: u64,
     sequence: Option<u64>,
     series_key: Option<String>,
+    ts_layout: Option<TsLayout>,
 }
 
 struct SequenceGap {
@@ -215,11 +261,67 @@ struct Inspection {
     gaps: Vec<SequenceGap>,
 }
 
+#[derive(Clone)]
+struct ProbeStream {
+    codec_type: String,
+    codec_name: String,
+    stream_id: Option<String>,
+    start_time: Option<f64>,
+    duration: Option<f64>,
+}
+
+#[derive(Clone)]
+struct ProbeInfo {
+    streams: Vec<ProbeStream>,
+    start_time: Option<f64>,
+    duration: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackKind {
+    Audio,
+    Video,
+    Muxed,
+    Other,
+}
+
+struct TrackProbe {
+    kind: TrackKind,
+    codec: String,
+    files: Vec<MediaFile>,
+    segment_durations: Vec<f64>,
+    start_time: f64,
+    end_time: f64,
+}
+
+struct AudioVideoPair {
+    audio: TrackProbe,
+    video: TrackProbe,
+    start_delta: f64,
+    end_delta: f64,
+}
+
+enum AvAssessment {
+    SingleProgram,
+    Pair(AudioVideoPair),
+    Unsafe(String),
+}
+
+enum DirectoryAction {
+    Concatenate {
+        groups: Vec<Vec<MediaFile>>,
+        output_files: Vec<PathBuf>,
+    },
+    MuxTracks {
+        pair: AudioVideoPair,
+        output_file: PathBuf,
+    },
+}
+
 struct DirectoryPlan {
     label: String,
     inspection: Inspection,
-    groups: Vec<Vec<MediaFile>>,
-    output_files: Vec<PathBuf>,
+    action: DirectoryAction,
 }
 
 fn group_candidates_by_directory(candidates: Vec<PathBuf>) -> BTreeMap<PathBuf, Vec<PathBuf>> {
@@ -287,11 +389,13 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
             .and_then(OsStr::to_str)
             .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"));
 
+        let mut ts_layout = None;
         if is_ts {
             let Some(layout) = detect_ts_layout(&path, size)? else {
                 skipped_typescript.push(path);
                 continue;
             };
+            ts_layout = Some(layout);
             if size % layout.stride as u64 != 0 {
                 let (checked_packets, invalid_syncs) = inspect_ts_packets(&path, size, layout)?;
                 warnings.push(format!(
@@ -314,6 +418,7 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
             size,
             sequence,
             series_key,
+            ts_layout,
         });
     }
 
@@ -668,6 +773,636 @@ fn irregular_filename_samples(inspection: &Inspection) -> Vec<PathBuf> {
         .collect()
 }
 
+const AV_SYNC_TOLERANCE_SECONDS: f64 = 0.25;
+
+fn assess_audio_video_tracks(inspection: &Inspection, ffprobe: Option<&Path>) -> AvAssessment {
+    let mut series: BTreeMap<String, Vec<MediaFile>> = BTreeMap::new();
+    for file in &inspection.files {
+        if let (Some(key), Some(_)) = (&file.series_key, file.sequence) {
+            series.entry(key.clone()).or_default().push(file.clone());
+        }
+    }
+
+    if series.len() == 1 {
+        let Some(ffprobe) = ffprobe else {
+            return AvAssessment::SingleProgram;
+        };
+        let (key, files) = series.into_iter().next().unwrap();
+        match probe_series_kind(ffprobe, &files) {
+            Ok(TrackKind::Audio) => {
+                return AvAssessment::Unsafe(
+                    "只识别到音频轨，没有可配对的视频轨；不会把音频分片伪装成视频合并。"
+                        .to_string(),
+                );
+            }
+            Ok(TrackKind::Video | TrackKind::Muxed) | Err(_) => {
+                return AvAssessment::SingleProgram;
+            }
+            Ok(TrackKind::Other) => {
+                return AvAssessment::Unsafe(format!(
+                    "编号序列「{}」不包含可识别的音视频流，无法安全合并。",
+                    display_series_key(&key)
+                ));
+            }
+        }
+    }
+
+    if series.is_empty() {
+        if inspection.files.len() == 1 {
+            return AvAssessment::SingleProgram;
+        }
+        if inspection.files.len() != 2 {
+            return AvAssessment::Unsafe(
+                "文件名没有可识别的编号序列，无法安全分组音视频轨。".to_string(),
+            );
+        }
+        let Some(ffprobe) = ffprobe else {
+            return AvAssessment::Unsafe(
+                "文件名没有编号序列，且未找到 ffprobe；无法判定是否为独立音视频轨。".to_string(),
+            );
+        };
+        let mut files = inspection.files.clone();
+        files.sort_by(compare_media_files);
+        let mut probes = Vec::new();
+        for file in files {
+            match probe_track_series(ffprobe, vec![file]) {
+                Ok(track) => probes.push(track),
+                Err(error) => {
+                    return AvAssessment::Unsafe(format!("无法探测候选音视频文件：{error}"));
+                }
+            }
+        }
+        return assemble_audio_video_pair(probes);
+    }
+
+    if !inspection.gaps.is_empty() {
+        return AvAssessment::Unsafe(
+            "候选音视频分轨存在缺片；先补齐分片再复用，避免跨缺口错配。".to_string(),
+        );
+    }
+    let Some(ffprobe) = ffprobe else {
+        return AvAssessment::Unsafe(
+            "检测到多个编号序列，但未找到 ffprobe；为避免把独立音视频轨直接拼接，已停止。"
+                .to_string(),
+        );
+    };
+
+    if inspection
+        .files
+        .iter()
+        .any(|file| file.sequence.is_none() && !is_init_file(&file.path))
+    {
+        return AvAssessment::Unsafe(
+            "存在无法归入编号序列的文件，无法安全判定音视频配对。".to_string(),
+        );
+    }
+
+    let mut tracks = Vec::new();
+    for (key, mut files) in series {
+        files.sort_by_key(|file| file.sequence.unwrap_or_default());
+        match probe_track_series(ffprobe, files) {
+            Ok(track) => tracks.push((key, track)),
+            Err(error) => {
+                return AvAssessment::Unsafe(format!(
+                    "无法可靠探测编号序列「{}」：{error}。不会把多个序列直接拼接。",
+                    display_series_key(&key)
+                ));
+            }
+        }
+    }
+
+    let mut audio_tracks = Vec::new();
+    let mut video_tracks = Vec::new();
+    let mut other_track_count = 0;
+    for (key, track) in tracks {
+        match track.kind {
+            TrackKind::Audio => audio_tracks.push(track),
+            TrackKind::Video => video_tracks.push(track),
+            TrackKind::Muxed => {
+                return AvAssessment::Unsafe(format!(
+                    "编号序列「{}」本身已包含音视频流，但目录还有其他序列；无法判断应如何配对。",
+                    display_series_key(&key)
+                ));
+            }
+            TrackKind::Other => other_track_count += 1,
+        }
+    }
+
+    if audio_tracks.len() != 1 || video_tracks.len() != 1 || other_track_count != 0 {
+        return AvAssessment::Unsafe(format!(
+            "检测到多个序列，但无法唯一识别一条音轨和一条视频轨（音轨 {} 组、视频轨 {} 组、其他 {} 组）；不会猜测配对。",
+            audio_tracks.len(),
+            video_tracks.len(),
+            other_track_count
+        ));
+    }
+    assemble_audio_video_pair([audio_tracks.pop().unwrap(), video_tracks.pop().unwrap()].into())
+}
+
+fn probe_series_kind(ffprobe: &Path, files: &[MediaFile]) -> io::Result<TrackKind> {
+    let first = files
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "编号序列为空"))?;
+    let last = files.last().unwrap();
+    let first_probe = probe_media_file(ffprobe, &first.path)?;
+    let last_probe = if first.path == last.path {
+        first_probe.clone()
+    } else {
+        probe_media_file(ffprobe, &last.path)?
+    };
+    let kind = classify_probe(&first_probe);
+    if classify_probe(&last_probe) != kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "首尾片段的流类型不一致",
+        ));
+    }
+    Ok(kind)
+}
+
+fn assemble_audio_video_pair(mut tracks: Vec<TrackProbe>) -> AvAssessment {
+    let mut audio = Vec::new();
+    let mut video = Vec::new();
+    let mut other_count = 0;
+    for track in tracks.drain(..) {
+        match track.kind {
+            TrackKind::Audio => audio.push(track),
+            TrackKind::Video => video.push(track),
+            TrackKind::Muxed | TrackKind::Other => other_count += 1,
+        }
+    }
+    if audio.len() != 1 || video.len() != 1 || other_count != 0 {
+        return AvAssessment::Unsafe(format!(
+            "无法唯一识别一条音轨和一条视频轨（音轨 {} 组、视频轨 {} 组、其他 {} 组）；不会猜测配对。",
+            audio.len(),
+            video.len(),
+            other_count
+        ));
+    }
+    let audio = audio.pop().unwrap();
+    let video = video.pop().unwrap();
+    let (start_delta, end_delta) = match compare_track_time_ranges(
+        video.start_time,
+        video.end_time,
+        audio.start_time,
+        audio.end_time,
+    ) {
+        Ok(deltas) => deltas,
+        Err(error) => return AvAssessment::Unsafe(error.to_string()),
+    };
+    AvAssessment::Pair(AudioVideoPair {
+        audio,
+        video,
+        start_delta,
+        end_delta,
+    })
+}
+
+fn parse_ts_pid(stream_id: &str) -> Option<u16> {
+    let pid = stream_id
+        .strip_prefix("0x")
+        .and_then(|value| u16::from_str_radix(value, 16).ok())
+        .or_else(|| stream_id.parse::<u16>().ok())?;
+    Some(pid)
+}
+
+fn find_first_pes_pts(path: &Path, layout: TsLayout, target_pid: u16) -> io::Result<u64> {
+    let mut reader = BufReader::new(File::open(path)?);
+    reader.seek(SeekFrom::Start(layout.sync_offset as u64))?;
+    let mut packet = vec![0u8; layout.stride];
+
+    loop {
+        let bytes = reader.read(&mut packet)?;
+        if bytes < 188 || packet[0] != 0x47 {
+            if bytes == 0 {
+                break;
+            }
+            continue;
+        }
+
+        let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+        let payload_start = packet[1] & 0x40 != 0;
+        let adaptation_control = (packet[3] >> 4) & 0x03;
+        if pid != target_pid || !payload_start || adaptation_control & 0x01 == 0 {
+            continue;
+        }
+
+        let payload_offset = if adaptation_control & 0x02 != 0 {
+            5 + packet[4] as usize
+        } else {
+            4
+        };
+        if payload_offset + 14 > bytes || packet[payload_offset..payload_offset + 3] != [0, 0, 1] {
+            continue;
+        }
+        let flags = (packet[payload_offset + 7] >> 6) & 0x03;
+        if flags != 0x02 && flags != 0x03 {
+            continue;
+        }
+        let pts = &packet[payload_offset + 9..payload_offset + 14];
+        return Ok((((pts[0] as u64 >> 1) & 0x07) << 30)
+            | ((pts[1] as u64) << 22)
+            | (((pts[2] as u64 >> 1) & 0x7f) << 15)
+            | ((pts[3] as u64) << 7)
+            | ((pts[4] as u64 >> 1) & 0x7f));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{} 中未找到目标 TS 流的 PTS", file_name_display(path)),
+    ))
+}
+
+fn normalize_pts_ticks(timestamps: &[u64]) -> io::Result<Vec<f64>> {
+    const PTS_WRAP: u64 = 1 << 33;
+    const PTS_HALF_WRAP: u64 = 1 << 32;
+    let mut offset = 0u64;
+    let mut previous: Option<u64> = None;
+    let mut normalized = Vec::with_capacity(timestamps.len());
+
+    for &timestamp in timestamps {
+        let mut current = timestamp.saturating_add(offset);
+        if let Some(previous) = previous
+            && current < previous
+        {
+            if previous - current > PTS_HALF_WRAP {
+                offset = offset.saturating_add(PTS_WRAP);
+                current = timestamp.saturating_add(offset);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TS 分片的 PTS 没有递增",
+                ));
+            }
+        }
+        previous = Some(current);
+        normalized.push(current as f64 / 90_000.0);
+    }
+    Ok(normalized)
+}
+
+fn probe_track_series(ffprobe: &Path, files: Vec<MediaFile>) -> io::Result<TrackProbe> {
+    let first_file = files
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "编号序列为空"))?;
+    let last_file = files.last().unwrap();
+    let first = probe_media_file(ffprobe, &first_file.path)?;
+    let last = if first_file.path == last_file.path {
+        first.clone()
+    } else {
+        probe_media_file(ffprobe, &last_file.path)?
+    };
+    let kind = classify_probe(&first);
+    if !matches!(kind, TrackKind::Audio | TrackKind::Video) || classify_probe(&last) != kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "首尾片段的流类型不一致，或片段同时包含音频和视频",
+        ));
+    }
+
+    let first_stream = first
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == track_kind_name(kind))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "首片缺少目标媒体流"))?;
+    let last_stream = last
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == track_kind_name(kind))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "尾片缺少目标媒体流"))?;
+    if first_stream.codec_name != last_stream.codec_name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "首尾片段编码不一致",
+        ));
+    }
+
+    let all_ts = files.iter().all(|file| file.ts_layout.is_some());
+    let no_ts = files.iter().all(|file| file.ts_layout.is_none());
+    if !all_ts && !no_ts {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "同一轨道混有 TS 与其他容器，无法统一计算分片时间线",
+        ));
+    }
+
+    let segment_starts = if all_ts {
+        let first_pid = first_stream
+            .stream_id
+            .as_deref()
+            .and_then(parse_ts_pid)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "ffprobe 未提供 TS 流 PID")
+            })?;
+        let last_pid = last_stream
+            .stream_id
+            .as_deref()
+            .and_then(parse_ts_pid)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "无法解析尾片 TS 流 PID"))?;
+        if first_pid != last_pid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "首尾 TS 片段的流 PID 不一致",
+            ));
+        }
+        let raw_timestamps = files
+            .iter()
+            .map(|file| find_first_pes_pts(&file.path, file.ts_layout.unwrap(), first_pid))
+            .collect::<io::Result<Vec<_>>>()?;
+        normalize_pts_ticks(&raw_timestamps)?
+    } else {
+        const MAX_NON_TS_SEGMENTS_TO_PROBE: usize = 128;
+        if files.len() > MAX_NON_TS_SEGMENTS_TO_PROBE {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "非 TS 分轨有 {} 个片段；为避免逐片启动 ffprobe 造成大量开销，当前上限为 {}",
+                    files.len(),
+                    MAX_NON_TS_SEGMENTS_TO_PROBE
+                ),
+            ));
+        }
+        let mut starts = Vec::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            let probe = if index == 0 {
+                first.clone()
+            } else if index + 1 == files.len() {
+                last.clone()
+            } else {
+                probe_media_file_start(ffprobe, &file.path)?
+            };
+            if classify_probe(&probe) != kind {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "分片 {} 的流类型与首片不一致",
+                        file_name_display(&file.path)
+                    ),
+                ));
+            }
+            let stream = probe
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type == track_kind_name(kind))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "分片缺少目标媒体流"))?;
+            if stream.codec_name != first_stream.codec_name {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("分片 {} 的编码与首片不一致", file_name_display(&file.path)),
+                ));
+            }
+            starts.push(probe.start_time.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "无法读取分片 {} 的起始时间戳",
+                        file_name_display(&file.path)
+                    ),
+                )
+            })?);
+        }
+        starts
+    };
+
+    let mut segment_durations = Vec::with_capacity(files.len());
+    for pair in segment_starts.windows(2) {
+        let duration = pair[1] - pair[0];
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "分片起始时间没有递增",
+            ));
+        }
+        segment_durations.push(duration);
+    }
+    let last_duration = last
+        .duration
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "无法读取尾片时长"))?;
+    if !last_duration.is_finite() || last_duration <= 0.0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "尾片时长无效"));
+    }
+    segment_durations.push(last_duration);
+
+    let start_time = segment_starts[0];
+    let last_start = *segment_starts.last().unwrap();
+    let end_time = last_start + last_duration;
+    if !start_time.is_finite() || !end_time.is_finite() || end_time <= start_time {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "片段起止时间无效",
+        ));
+    }
+
+    Ok(TrackProbe {
+        kind,
+        codec: first_stream.codec_name.clone(),
+        files,
+        segment_durations,
+        start_time,
+        end_time,
+    })
+}
+
+fn classify_probe(probe: &ProbeInfo) -> TrackKind {
+    let audio_count = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "audio")
+        .count();
+    let video_count = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "video")
+        .count();
+    match (audio_count, video_count) {
+        (1, 0) => TrackKind::Audio,
+        (0, 1) => TrackKind::Video,
+        (audio, video) if audio > 0 && video > 0 => TrackKind::Muxed,
+        _ => TrackKind::Other,
+    }
+}
+
+fn track_kind_name(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Audio => "audio",
+        TrackKind::Video => "video",
+        TrackKind::Muxed | TrackKind::Other => "",
+    }
+}
+
+fn probe_media_file(ffprobe: &Path, path: &Path) -> io::Result<ProbeInfo> {
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=start_time,duration:stream=codec_type,codec_name,id,start_time,duration",
+            "-of",
+            "flat",
+        ])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            compact_text(message.trim(), 160),
+        ));
+    }
+
+    let output = String::from_utf8_lossy(&output.stdout);
+    let probe = parse_ffprobe_flat(&output);
+    if probe.streams.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ffprobe 未识别到音频或视频流",
+        ));
+    }
+    Ok(probe)
+}
+
+fn probe_media_streams(ffprobe: &Path, path: &Path) -> io::Result<ProbeInfo> {
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,id",
+            "-of",
+            "flat",
+        ])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            compact_text(message.trim(), 160),
+        ));
+    }
+    let probe = parse_ffprobe_flat(&String::from_utf8_lossy(&output.stdout));
+    if probe.streams.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ffprobe 未识别到输出音视频流",
+        ));
+    }
+    Ok(probe)
+}
+
+fn probe_media_file_start(ffprobe: &Path, path: &Path) -> io::Result<ProbeInfo> {
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=start_time:stream=codec_type,codec_name,id,start_time",
+            "-of",
+            "flat",
+        ])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            compact_text(message.trim(), 160),
+        ));
+    }
+    Ok(parse_ffprobe_flat(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_ffprobe_flat(output: &str) -> ProbeInfo {
+    let mut streams: BTreeMap<usize, BTreeMap<String, String>> = BTreeMap::new();
+    let mut format_start = None;
+    let mut format_duration = None;
+
+    for line in output.lines() {
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = raw_value.trim().trim_matches('"').to_string();
+        if key == "format.start_time" {
+            format_start = parse_seconds(Some(&value));
+        } else if key == "format.duration" {
+            format_duration = parse_seconds(Some(&value));
+        } else if let Some(rest) = key.strip_prefix("streams.stream.")
+            && let Some((index, field)) = rest.split_once('.')
+            && let Ok(index) = index.parse::<usize>()
+        {
+            streams
+                .entry(index)
+                .or_default()
+                .insert(field.to_string(), value);
+        }
+    }
+
+    let streams: Vec<ProbeStream> = streams
+        .into_values()
+        .map(|fields| ProbeStream {
+            codec_type: fields.get("codec_type").cloned().unwrap_or_default(),
+            codec_name: fields.get("codec_name").cloned().unwrap_or_default(),
+            stream_id: fields.get("id").cloned(),
+            start_time: fields
+                .get("start_time")
+                .and_then(|value| parse_seconds(Some(value))),
+            duration: fields
+                .get("duration")
+                .and_then(|value| parse_seconds(Some(value))),
+        })
+        .collect();
+    let start_time = format_start.or_else(|| {
+        streams
+            .iter()
+            .filter_map(|stream| stream.start_time)
+            .min_by(f64::total_cmp)
+    });
+    let duration = format_duration.or_else(|| {
+        streams
+            .iter()
+            .filter_map(|stream| stream.duration)
+            .max_by(f64::total_cmp)
+    });
+
+    ProbeInfo {
+        streams,
+        start_time,
+        duration,
+    }
+}
+
+fn parse_seconds(value: Option<&String>) -> Option<f64> {
+    let seconds = value?.parse::<f64>().ok()?;
+    seconds.is_finite().then_some(seconds)
+}
+
+fn print_audio_video_plan(pair: &AudioVideoPair, output: &Path) {
+    println!("识别到一组可配对的独立音视频轨：");
+    println!(
+        "  视频：{} 个文件（{} → {}），{}，时间 {:.3}–{:.3}s",
+        pair.video.files.len(),
+        file_name_display(&pair.video.files.first().unwrap().path),
+        file_name_display(&pair.video.files.last().unwrap().path),
+        pair.video.codec,
+        pair.video.start_time,
+        pair.video.end_time
+    );
+    println!(
+        "  音频：{} 个文件（{} → {}），{}，时间 {:.3}–{:.3}s",
+        pair.audio.files.len(),
+        file_name_display(&pair.audio.files.first().unwrap().path),
+        file_name_display(&pair.audio.files.last().unwrap().path),
+        pair.audio.codec,
+        pair.audio.start_time,
+        pair.audio.end_time
+    );
+    println!(
+        "  起止偏差：{:.3}s / {:.3}s（限制 {:.3}s）",
+        pair.start_delta, pair.end_delta, AV_SYNC_TOLERANCE_SECONDS
+    );
+    println!("  输出：{}", compact_text(&file_name_display(output), 88));
+}
+
 fn build_merge_groups(
     files: &[MediaFile],
     gaps: &[SequenceGap],
@@ -842,6 +1577,390 @@ fn ask_yes_no(prompt: &str) -> io::Result<bool> {
     ))
 }
 
+struct TempWorkspace {
+    path: PathBuf,
+}
+
+impl TempWorkspace {
+    fn new(parent: &Path) -> io::Result<Self> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..10 {
+            let path = parent.join(format!(".rcm-mux-{}-{now}-{attempt}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "无法创建音视频复用临时目录",
+        ))
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn write_concat_playlist(path: &Path, track: &TrackProbe) -> io::Result<()> {
+    let mut playlist = BufWriter::new(File::create(path)?);
+    for (file, duration) in track.files.iter().zip(&track.segment_durations) {
+        let path = file.path.display().to_string();
+        let path = path.strip_prefix("\\\\?\\").unwrap_or(&path);
+        let escaped = path.replace('\\', "/").replace('\'', "'\\''");
+        writeln!(playlist, "file '{escaped}'")?;
+        writeln!(playlist, "duration {duration:.6}")?;
+    }
+    playlist.flush()
+}
+
+#[derive(Default)]
+struct PacketTimeline {
+    packets: u64,
+    pts_packets: u64,
+    dts_packets: u64,
+    min_pts: Option<f64>,
+    max_pts_end: Option<f64>,
+    last_dts: Option<f64>,
+    dts_regressions: u64,
+}
+
+#[derive(Default)]
+struct RuntimeTimeline {
+    video: PacketTimeline,
+    audio: PacketTimeline,
+}
+
+struct DebugPacket {
+    input_index: usize,
+    kind: TrackKind,
+    pts: Option<f64>,
+    dts: Option<f64>,
+    duration: Option<f64>,
+}
+
+fn parse_debug_packet(line: &str) -> Option<DebugPacket> {
+    let rest = line.split_once("demuxer -> ist_index:")?.1;
+    let mut tokens = rest.split_whitespace();
+    let input_index = tokens.next()?.split(':').next()?.parse().ok()?;
+    let mut kind = None;
+    let mut pts = None;
+    let mut dts = None;
+    let mut duration = None;
+    for token in tokens {
+        let Some((key, value)) = token.split_once(':') else {
+            continue;
+        };
+        match key {
+            "type" => {
+                kind = match value {
+                    "audio" => Some(TrackKind::Audio),
+                    "video" => Some(TrackKind::Video),
+                    _ => None,
+                };
+            }
+            "pkt_pts_time" => pts = parse_debug_seconds(value),
+            "pkt_dts_time" => dts = parse_debug_seconds(value),
+            "duration_time" => duration = parse_debug_seconds(value),
+            _ => {}
+        }
+    }
+    Some(DebugPacket {
+        input_index,
+        kind: kind?,
+        pts,
+        dts,
+        duration,
+    })
+}
+
+fn parse_debug_seconds(value: &str) -> Option<f64> {
+    let seconds = value.parse::<f64>().ok()?;
+    seconds.is_finite().then_some(seconds)
+}
+
+fn display_ffmpeg_progress(output: impl Read, total_duration: f64) -> io::Result<()> {
+    let mut out_time_us = None;
+    let mut last_reported_percent = 0i32;
+
+    for line in BufReader::new(output).lines() {
+        let line = line?;
+        if let Some(value) = line.strip_prefix("out_time_us=") {
+            out_time_us = value.parse::<i64>().ok().filter(|value| *value >= 0);
+        } else if line == "progress=continue" {
+            if let Some(out_time_us) = out_time_us {
+                let percent = if total_duration > 0.0 {
+                    ((out_time_us as f64 / 1_000_000.0 / total_duration) * 100.0).clamp(0.0, 99.0)
+                        as i32
+                } else {
+                    0
+                };
+                if percent >= last_reported_percent + 5 {
+                    println!("音视频复用进度：{percent}%");
+                    last_reported_percent = percent;
+                }
+            }
+        } else if line == "progress=end" {
+            println!("FFmpeg 已读完输入，正在校验临时输出…");
+        }
+    }
+    Ok(())
+}
+
+fn run_ffmpeg_with_timeline(command: &mut Command, total_duration: f64) -> io::Result<()> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let progress = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("无法读取 ffmpeg 进度输出"))?;
+    let progress_thread = thread::spawn(move || display_ffmpeg_progress(progress, total_duration));
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("无法读取 ffmpeg 时间戳检查输出"))?;
+    let mut timeline = RuntimeTimeline::default();
+    let mut diagnostics = VecDeque::with_capacity(8);
+
+    for line in BufReader::new(stderr).lines() {
+        let line = line?;
+        if let Some(packet) = parse_debug_packet(&line) {
+            let expected_input = match packet.kind {
+                TrackKind::Video => 0,
+                TrackKind::Audio => 1,
+                TrackKind::Muxed | TrackKind::Other => continue,
+            };
+            if packet.input_index != expected_input {
+                continue;
+            }
+            let track = match packet.kind {
+                TrackKind::Video => &mut timeline.video,
+                TrackKind::Audio => &mut timeline.audio,
+                TrackKind::Muxed | TrackKind::Other => continue,
+            };
+            track.packets += 1;
+            if let Some(pts) = packet.pts {
+                track.pts_packets += 1;
+                track.min_pts = Some(track.min_pts.map_or(pts, |current| current.min(pts)));
+                let packet_end = pts + packet.duration.unwrap_or(0.0).max(0.0);
+                track.max_pts_end = Some(
+                    track
+                        .max_pts_end
+                        .map_or(packet_end, |current| current.max(packet_end)),
+                );
+            }
+            if let Some(dts) = packet.dts {
+                track.dts_packets += 1;
+                if track
+                    .last_dts
+                    .is_some_and(|previous| dts + 0.001 < previous)
+                {
+                    track.dts_regressions += 1;
+                }
+                track.last_dts = Some(dts);
+            }
+        } else if line.contains("Non-monotonous DTS")
+            || line.contains("Invalid data found")
+            || line.contains("Error while decoding")
+        {
+            if diagnostics.len() == 8 {
+                diagnostics.pop_front();
+            }
+            diagnostics.push_back(line);
+        }
+    }
+
+    let status = child.wait()?;
+    progress_thread
+        .join()
+        .map_err(|_| io::Error::other("ffmpeg 进度读取线程异常"))??;
+    if !status.success() {
+        let detail = diagnostics.into_iter().collect::<Vec<_>>().join(" | ");
+        return Err(io::Error::other(format!(
+            "ffmpeg 退出码 {}{}",
+            status.code().unwrap_or(-1),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("：{detail}")
+            }
+        )));
+    }
+    if !diagnostics.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            diagnostics.into_iter().collect::<Vec<_>>().join(" | "),
+        ));
+    }
+
+    validate_runtime_timeline(&timeline)?;
+    let video_start = timeline.video.min_pts.unwrap();
+    let video_end = timeline.video.max_pts_end.unwrap();
+    let audio_start = timeline.audio.min_pts.unwrap();
+    let audio_end = timeline.audio.max_pts_end.unwrap();
+    let (start_delta, end_delta) =
+        compare_track_time_ranges(video_start, video_end, audio_start, audio_end).map_err(
+            |error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("完整流时间戳不对齐：{error}"),
+                )
+            },
+        )?;
+    println!(
+        "PTS/DTS 单次流检查通过：视频 {} 包、音频 {} 包；起止偏差 {:.3}s / {:.3}s。",
+        timeline.video.packets, timeline.audio.packets, start_delta, end_delta
+    );
+    Ok(())
+}
+
+fn compare_track_time_ranges(
+    video_start: f64,
+    video_end: f64,
+    audio_start: f64,
+    audio_end: f64,
+) -> io::Result<(f64, f64)> {
+    if ![video_start, video_end, audio_start, audio_end]
+        .into_iter()
+        .all(f64::is_finite)
+        || video_end <= video_start
+        || audio_end <= audio_start
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "音视频起止时间无效，无法确认是否对齐。",
+        ));
+    }
+    let start_delta = (video_start - audio_start).abs();
+    let end_delta = (video_end - audio_end).abs();
+    if start_delta > AV_SYNC_TOLERANCE_SECONDS || end_delta > AV_SYNC_TOLERANCE_SECONDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "音视频时间范围未对齐：起点相差 {:.3}s、终点相差 {:.3}s（容差 {:.3}s）",
+                start_delta, end_delta, AV_SYNC_TOLERANCE_SECONDS
+            ),
+        ));
+    }
+    Ok((start_delta, end_delta))
+}
+
+fn validate_runtime_timeline(timeline: &RuntimeTimeline) -> io::Result<()> {
+    for (name, track) in [("视频", &timeline.video), ("音频", &timeline.audio)] {
+        if track.packets == 0 || track.pts_packets == 0 || track.dts_packets == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name}流没有可校验的完整 PTS/DTS 时间戳"),
+            ));
+        }
+        if track.dts_regressions > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name}流发现 {} 次 DTS 倒退", track.dts_regressions),
+            ));
+        }
+        if track.min_pts.is_none() || track.max_pts_end.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name}流缺少可比较的 PTS 范围"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mux_audio_video(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    pair: &AudioVideoPair,
+    output_file: &Path,
+    output_ts: bool,
+) -> io::Result<()> {
+    let output_dir = output_file.parent().unwrap_or(Path::new("."));
+    let workspace = TempWorkspace::new(output_dir)?;
+    let video_playlist = workspace.path.join("video.ffconcat");
+    let audio_playlist = workspace.path.join("audio.ffconcat");
+    write_concat_playlist(&video_playlist, &pair.video)?;
+    write_concat_playlist(&audio_playlist, &pair.audio)?;
+
+    let temp_output = workspace.path.join(if output_ts {
+        "muxed.partial.ts"
+    } else {
+        "muxed.partial.mp4"
+    });
+    let mut command = Command::new(ffmpeg);
+    command
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("info")
+        .arg("-debug_ts")
+        .arg("-progress")
+        .arg("pipe:1")
+        .arg("-stats_period")
+        .arg("5")
+        .arg("-xerror")
+        .arg("-copyts")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&video_playlist)
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&audio_playlist)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c")
+        .arg("copy");
+    if output_ts {
+        command.arg("-f").arg("mpegts");
+    } else {
+        command.arg("-movflags").arg("+faststart");
+    }
+    let total_duration = pair.video.end_time.max(pair.audio.end_time)
+        - pair.video.start_time.min(pair.audio.start_time);
+    run_ffmpeg_with_timeline(command.arg(&temp_output), total_duration)?;
+
+    let output_probe = probe_media_streams(ffprobe, &temp_output)?;
+    if classify_probe(&output_probe) != TrackKind::Muxed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "临时输出未同时包含音频流和视频流",
+        ));
+    }
+
+    publish_output(&temp_output, output_file, &workspace.path)?;
+    Ok(())
+}
+
+fn publish_output(temp_output: &Path, output_file: &Path, workspace: &Path) -> io::Result<()> {
+    if !output_file.exists() {
+        return std::fs::rename(temp_output, output_file);
+    }
+
+    let backup = workspace.join("previous-output");
+    std::fs::rename(output_file, &backup)?;
+    if let Err(error) = std::fs::rename(temp_output, output_file) {
+        let _ = std::fs::rename(&backup, output_file);
+        return Err(error);
+    }
+    std::fs::remove_file(backup)
+}
+
 fn merge_files(files: &[MediaFile], output_file: &Path) -> io::Result<()> {
     let mut outfile = BufWriter::new(
         OpenOptions::new()
@@ -979,13 +2098,28 @@ fn which_ffmpeg() -> Option<PathBuf> {
     None
 }
 
+fn which_ffprobe() -> Option<PathBuf> {
+    if let Ok(ffprobe_in_path) = which::which("ffprobe") {
+        return Some(ffprobe_in_path);
+    }
+
+    for candidate in ["./ffprobe", "./ffprobe.exe"] {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_merge_groups, build_output_paths, collect_media_files, compact_text,
-        compare_media_files, file_name_display, group_candidates_by_directory,
-        inspect_candidate_files, inspect_media_files, irregular_filename_samples, is_dotfile,
-        parse_args, resolve_input_dir,
+        TsLayout, build_merge_groups, build_output_paths, classify_probe, collect_media_files,
+        compact_text, compare_media_files, compare_track_time_ranges, file_name_display,
+        find_first_pes_pts, group_candidates_by_directory, inspect_candidate_files,
+        inspect_media_files, irregular_filename_samples, is_dotfile, normalize_pts_ticks,
+        parse_args, parse_debug_packet, parse_ffprobe_flat, resolve_input_dir,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -999,6 +2133,84 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn checks_audio_video_timeline_with_small_boundary_tolerance() {
+        assert!(compare_track_time_ranges(1.0, 3.0, 1.1, 2.95).is_ok());
+        assert!(compare_track_time_ranges(1.0, 3.0, 1.5, 2.95).is_err());
+        assert!(compare_track_time_ranges(1.0, 1.0, 1.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn parses_ffprobe_stream_metadata_and_timeline() {
+        let probe = parse_ffprobe_flat(
+            r#"streams.stream.0.codec_type="video"
+streams.stream.0.codec_name="h264"
+streams.stream.0.start_time="1.250000"
+format.start_time="1.250000"
+format.duration="2.000000""#,
+        );
+        assert_eq!(classify_probe(&probe), super::TrackKind::Video);
+        assert_eq!(probe.start_time, Some(1.25));
+        assert_eq!(probe.duration, Some(2.0));
+        assert_eq!(probe.streams[0].codec_name, "h264");
+    }
+
+    #[test]
+    fn extracts_segment_pts_from_transport_stream_packets() {
+        let root = temp_dir("ts-pts-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let pid = 0x100u16;
+        let ticks = 126_000u64;
+        let pts = [
+            0x21 | ((((ticks >> 30) & 0x07) as u8) << 1),
+            (ticks >> 22) as u8,
+            ((((ticks >> 15) & 0x7f) as u8) << 1) | 1,
+            (ticks >> 7) as u8,
+            (((ticks & 0x7f) as u8) << 1) | 1,
+        ];
+        let mut packet = [0xffu8; 188];
+        packet[0] = 0x47;
+        packet[1] = 0x40 | ((pid >> 8) as u8 & 0x1f);
+        packet[2] = pid as u8;
+        packet[3] = 0x10;
+        packet[4..13].copy_from_slice(&[0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5]);
+        packet[13..18].copy_from_slice(&pts);
+        let path = root.join("segment.ts");
+        std::fs::write(&path, packet).unwrap();
+
+        assert_eq!(
+            find_first_pes_pts(
+                &path,
+                TsLayout {
+                    stride: 188,
+                    sync_offset: 0,
+                },
+                pid
+            )
+            .unwrap(),
+            ticks
+        );
+        assert_eq!(
+            normalize_pts_ticks(&[90_000, 180_000]).unwrap(),
+            vec![1.0, 2.0]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_ffmpeg_debug_pts_dts_packet_lines() {
+        let packet = parse_debug_packet(
+            "[aist#1:0/aac @ 0x123] demuxer -> ist_index:1:0 type:audio pkt_pts:126000 pkt_pts_time:1.400000 pkt_dts:126000 pkt_dts_time:1.400000 duration:1920 duration_time:0.021333",
+        )
+        .unwrap();
+        assert_eq!(packet.input_index, 1);
+        assert_eq!(packet.kind, super::TrackKind::Audio);
+        assert_eq!(packet.pts, Some(1.4));
+        assert_eq!(packet.dts, Some(1.4));
+        assert_eq!(packet.duration, Some(0.021333));
     }
 
     #[test]

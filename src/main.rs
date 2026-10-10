@@ -4,6 +4,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, remove_file};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write, copy};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -422,6 +423,7 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
         });
     }
 
+    infer_correlated_sequences(root, &mut files);
     files.sort_by(compare_media_files);
     let before_dedup = files.len();
     files = remove_identical_duplicates(files, &mut warnings)?;
@@ -465,6 +467,111 @@ fn sequence_details(root: &Path, path: &Path) -> (Option<u64>, Option<String>) {
     );
 
     (Some(sequence), Some(series_key))
+}
+
+struct NumberedFilename {
+    stem: String,
+    literals: Vec<String>,
+    numbers: Vec<(Range<usize>, u64)>,
+}
+
+fn parse_numbered_filename(path: &Path) -> Option<NumberedFilename> {
+    let stem = path.file_stem()?.to_str()?.to_lowercase();
+    if !stem.as_bytes().last()?.is_ascii_digit() {
+        return None;
+    }
+    let mut literals = Vec::new();
+    let mut numbers = Vec::new();
+    let mut cursor = 0;
+    let mut literal_start = 0;
+    while cursor < stem.len() {
+        if !stem.as_bytes()[cursor].is_ascii_digit() {
+            cursor += 1;
+            continue;
+        }
+        literals.push(stem[literal_start..cursor].to_string());
+        let start = cursor;
+        while cursor < stem.len() && stem.as_bytes()[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        numbers.push((start..cursor, stem[start..cursor].parse().ok()?));
+        literal_start = cursor;
+    }
+    literals.push(stem[literal_start..].to_string());
+    Some(NumberedFilename {
+        stem,
+        literals,
+        numbers,
+    })
+}
+
+fn infer_correlated_sequences(root: &Path, files: &mut [MediaFile]) {
+    let mut shapes: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for (index, file) in files.iter().enumerate() {
+        if file.sequence.is_none() || is_init_file(&file.path) {
+            continue;
+        }
+        let Some(parsed) = parse_numbered_filename(&file.path) else {
+            continue;
+        };
+        if parsed.numbers.len() < 2 {
+            continue;
+        }
+        let relative_parent = file
+            .path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(root).ok())
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        shapes
+            .entry((relative_parent, parsed.literals.clone()))
+            .or_default()
+            .push((index, parsed));
+    }
+
+    for ((relative_parent, _), entries) in shapes {
+        let last_column = entries[0].1.numbers.len() - 1;
+        let sequence_values: BTreeSet<u64> = entries
+            .iter()
+            .map(|(_, parsed)| parsed.numbers[last_column].1)
+            .collect();
+        // Two singleton tracks can happen to have matching offsets. Require more evidence
+        // before interpreting a changing prefix number as another segment counter.
+        if sequence_values.len() < 3 {
+            continue;
+        }
+        let first = &entries[0].1;
+        let offsets: Vec<Option<i128>> = (0..last_column)
+            .map(|column| {
+                let offset = first.numbers[column].1 as i128 - first.numbers[last_column].1 as i128;
+                entries
+                    .iter()
+                    .all(|(_, parsed)| {
+                        parsed.numbers[column].1 as i128 - parsed.numbers[last_column].1 as i128
+                            == offset
+                    })
+                    .then_some(offset)
+            })
+            .collect();
+        if offsets.iter().all(Option::is_none) {
+            continue;
+        }
+
+        for (index, parsed) in entries {
+            let mut prefix = String::new();
+            for (column, offset) in offsets.iter().enumerate() {
+                prefix.push_str(&parsed.literals[column]);
+                if let Some(offset) = offset {
+                    prefix.push_str(&format!("{{seq{offset:+}}}"));
+                } else {
+                    prefix.push_str(&parsed.stem[parsed.numbers[column].0.clone()]);
+                }
+            }
+            prefix.push_str(&parsed.literals[last_column]);
+            files[index].series_key =
+                Some(format!("{}::{prefix}", relative_parent.to_string_lossy()));
+        }
+    }
 }
 
 fn compare_media_files(left: &MediaFile, right: &MediaFile) -> Ordering {
@@ -2133,6 +2240,172 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn series_count(inspection: &super::Inspection) -> usize {
+        inspection
+            .files
+            .iter()
+            .filter_map(|file| file.series_key.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    #[test]
+    fn recognizes_synchronized_filename_counters_as_one_sequence() {
+        let root = temp_dir("synchronized-counters-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut transport_stream = vec![0xff; 188 * 4];
+        for offset in (0..transport_stream.len()).step_by(188) {
+            transport_stream[offset] = 0x47;
+        }
+        for counter in (2090..=2139).rev() {
+            std::fs::write(
+                root.join(format!("00_{counter:06}_index_4_{}.ts", counter + 95)),
+                &transport_stream,
+            )
+            .unwrap();
+        }
+
+        let inspection = inspect_media_files(&root, false).unwrap();
+        assert_eq!(inspection.files.len(), 50);
+        assert_eq!(series_count(&inspection), 1);
+        assert!(irregular_filename_samples(&inspection).is_empty());
+        assert!(inspection.gaps.is_empty());
+        assert_eq!(
+            inspection
+                .files
+                .iter()
+                .map(|file| file.sequence.unwrap())
+                .collect::<Vec<_>>(),
+            (2185..=2234).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            super::assess_audio_video_tracks(&inspection, None),
+            super::AvAssessment::SingleProgram
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checks_gaps_and_duplicates_with_synchronized_counters() {
+        let root = temp_dir("synchronized-gap-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for counter in [2090, 2091, 2093] {
+            std::fs::write(
+                root.join(format!("00_{counter:06}_index_4_{}.m4s", counter + 95)),
+                b"payload",
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("00_002091_index_4_2186.decrypt"), b"payload").unwrap();
+        std::fs::write(root.join("00_002090_index_4_2185.decrypt"), b"different").unwrap();
+
+        let inspection = inspect_media_files(&root, false).unwrap();
+        assert_eq!(series_count(&inspection), 1);
+        assert_eq!(inspection.duplicate_count, 1);
+        assert_eq!(inspection.files.len(), 4);
+        assert_eq!(inspection.gaps.len(), 1);
+        assert_eq!(inspection.gaps[0].missing_start, 2187);
+        assert_eq!(inspection.gaps[0].missing_end, 2187);
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("编号重复但二进制内容不同"))
+        );
+        assert_eq!(
+            build_merge_groups(&inspection.files, &inspection.gaps, true).len(),
+            2
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_numeric_track_identifiers_when_inferring_counters() {
+        let root = temp_dir("synchronized-tracks-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for counter in 2090..=2092 {
+            for (track, index) in [(0, 4), (1, 5)] {
+                std::fs::write(
+                    root.join(format!(
+                        "{track:02}_{counter:06}_index_{index}_{}.m4s",
+                        counter + 95
+                    )),
+                    b"payload",
+                )
+                .unwrap();
+            }
+        }
+
+        let inspection = inspect_media_files(&root, false).unwrap();
+        assert_eq!(inspection.files.len(), 6);
+        assert_eq!(series_count(&inspection), 2);
+        assert!(irregular_filename_samples(&inspection).is_empty());
+        assert!(inspection.gaps.is_empty());
+        assert!(matches!(
+            super::assess_audio_video_tracks(&inspection, None),
+            super::AvAssessment::Unsafe(_)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn does_not_infer_counters_with_inconsistent_offsets() {
+        let root = temp_dir("inconsistent-counters-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for (counter, sequence) in [(2090, 2185), (2091, 2186), (2100, 2187)] {
+            std::fs::write(
+                root.join(format!("00_{counter:06}_index_4_{sequence}.m4s")),
+                b"payload",
+            )
+            .unwrap();
+        }
+
+        let inspection = inspect_media_files(&root, false).unwrap();
+        assert_eq!(series_count(&inspection), 3);
+        assert_eq!(irregular_filename_samples(&inspection).len(), 3);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn does_not_coalesce_two_singleton_tracks_with_matching_offsets() {
+        let root = temp_dir("singleton-track-test");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("track1_001.m4s"), b"first").unwrap();
+        std::fs::write(root.join("track2_002.m4s"), b"second").unwrap();
+
+        let inspection = inspect_media_files(&root, false).unwrap();
+        assert_eq!(series_count(&inspection), 2);
+        assert_eq!(irregular_filename_samples(&inspection).len(), 2);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handles_unicode_and_padding_in_multiple_synchronized_counters() {
+        let root = temp_dir("unicode-counters-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in [
+            "切片00_2098_index_4_2118_2193.m4s",
+            "切片00_002099_index_4_002119_2194.m4s",
+            "切片00_2100_index_4_2120_2195.m4s",
+        ] {
+            std::fs::write(root.join(name), b"payload").unwrap();
+        }
+
+        let inspection = inspect_media_files(&root, false).unwrap();
+        assert_eq!(series_count(&inspection), 1);
+        assert!(irregular_filename_samples(&inspection).is_empty());
+        assert!(inspection.gaps.is_empty());
+        assert_eq!(inspection.files[0].sequence, Some(2193));
+        assert_eq!(inspection.files[2].sequence, Some(2195));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -14,9 +14,17 @@ use walkdir::{DirEntry, WalkDir};
 
 fn main() -> io::Result<()> {
     let options = parse_args(env::args().skip(1))?;
+    let version = env!("CARGO_PKG_VERSION");
+    if options.show_help {
+        print_help(version);
+        return Ok(());
+    }
+    if options.show_version {
+        println!("rcm {version}");
+        return Ok(());
+    }
     let current_dir = env::current_dir()?;
     let input_dir = resolve_input_dir(&current_dir, options.input_dir.as_deref())?;
-    let version = env!("CARGO_PKG_VERSION");
 
     println!("扫描目录: {}", compact_path(&input_dir, 80));
     if !options.include_hidden {
@@ -29,6 +37,12 @@ fn main() -> io::Result<()> {
     let candidates = collect_media_files(&input_dir, options.include_hidden, options.recursive);
     let directories = group_candidates_by_directory(candidates);
     if directories.is_empty() {
+        if options.start.is_some() || options.end.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "已指定 --start/--end，但扫描范围内没有可合并的媒体分片。",
+            ));
+        }
         println!("当前扫描范围内没有可合并的媒体分片。");
         if !options.recursive {
             println!("如分片位于子目录，请加 --recursive 扫描；递归时会按目录分别处理。");
@@ -49,7 +63,27 @@ fn main() -> io::Result<()> {
     for (directory, candidates) in directories {
         let label = directory_label(&input_dir, &directory);
         println!("\n=== 目录组：{} ===", compact_text(&label, 72));
-        let inspection = inspect_candidate_files(&directory, candidates)?;
+        let mut inspection = inspect_candidate_files(&directory, candidates)?;
+        if options.start.is_some() || options.end.is_some() {
+            let range = resolve_file_range(
+                &inspection.files,
+                options.start.as_deref(),
+                options.end.as_deref(),
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("目录组「{}」范围无效：{error}", compact_text(&label, 72)),
+                )
+            })?;
+            print_file_range(
+                &inspection.files,
+                &range,
+                options.start.as_deref(),
+                options.end.as_deref(),
+            );
+            apply_file_range(&mut inspection, &range);
+        }
         print_inspection(&inspection);
         if inspection.files.is_empty() {
             println!("该目录没有可合并的媒体分片，跳过。");
@@ -177,12 +211,56 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn print_help(version: &str) {
+    println!(
+        r#"rcm {version} - 媒体分片合并与音视频分轨复用工具
+
+用法：
+  rcm [选项]
+
+选项：
+  -h, --help              显示帮助并退出
+  -V, --version           显示版本并退出
+  -i, --input-dir <目录>  指定输入目录；相对路径基于当前工作目录
+      --this-dir          扫描当前工作目录（默认行为）
+      --recursive         扫描子目录，各目录独立确认和合并
+      --include-hidden    包含隐藏文件和 dotfile
+      --start <边界>      从指定文件开始（包含该文件）
+      --end <边界>        到指定文件结束（包含该文件）
+      --ts                输出 TS，不转换为 MP4
+
+说明：
+  默认扫描启动命令时的工作目录，而非程序所在目录；默认不扫描子目录。
+  普通分片默认尝试用 FFmpeg 转为 MP4；未找到 FFmpeg 时保留 TS。
+  独立音视频分轨需要 FFmpeg 和 ffprobe，使用 --ts 时也不例外。
+  展示文件范围、编号检查和合并计划后，用户确认才执行合并。
+  输出保存在扫描根目录的上一级。
+  范围边界先匹配完整文件名（含扩展名）；纯数字再匹配完整数字字段。
+  数字忽略前导零、不做子串匹配；未匹配数字字段时才按文件顺序号匹配。
+  顺序号从 1 开始，基于排序、去重后的有效文件列表；支持只指定一个边界。
+  多个文件匹配同一数字、越界或起点晚于终点时会报错，不自动猜测。
+  发现初始化片段时需将其包含在范围内，不会自动追加范围外文件。
+  使用 --recursive 时，各目录分别解析同一组范围；任一目录无效则停止。
+
+示例：
+  rcm
+  rcm --input-dir "路径/分片"
+  rcm --this-dir --recursive --ts
+  rcm --start "segment001.ts" --end "segment050.ts"
+  rcm --start 2090 --end 2139"#
+    );
+}
+
 #[derive(Default)]
 struct Options {
+    show_help: bool,
+    show_version: bool,
     skip_ffmpeg: bool,
     include_hidden: bool,
     recursive: bool,
     input_dir: Option<PathBuf>,
+    start: Option<String>,
+    end: Option<String>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> io::Result<Options> {
@@ -191,10 +269,32 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> io::Result<Options> {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                options.show_help = true;
+                return Ok(options);
+            }
+            "-V" | "--version" => {
+                options.show_version = true;
+                return Ok(options);
+            }
             "--ts" => options.skip_ffmpeg = true,
             "--include-hidden" => options.include_hidden = true,
             "--recursive" => options.recursive = true,
             "--this-dir" => options.input_dir = Some(PathBuf::from(".")),
+            "--start" => options.start = Some(parse_range_value(args.next(), "--start")?),
+            "--end" => options.end = Some(parse_range_value(args.next(), "--end")?),
+            value if value.starts_with("--start=") => {
+                options.start = Some(parse_range_value(
+                    Some(value["--start=".len()..].to_string()),
+                    "--start",
+                )?);
+            }
+            value if value.starts_with("--end=") => {
+                options.end = Some(parse_range_value(
+                    Some(value["--end=".len()..].to_string()),
+                    "--end",
+                )?);
+            }
             "-i" | "--input-dir" => {
                 let value = args.next().ok_or_else(|| {
                     io::Error::new(
@@ -210,6 +310,35 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> io::Result<Options> {
     }
 
     Ok(options)
+}
+
+fn parse_range_value(value: Option<String>, option: &str) -> io::Result<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && !matches!(
+                    value.as_str(),
+                    "-h" | "--help"
+                        | "-V"
+                        | "--version"
+                        | "-i"
+                        | "--input-dir"
+                        | "--this-dir"
+                        | "--recursive"
+                        | "--include-hidden"
+                        | "--ts"
+                        | "--start"
+                        | "--end"
+                )
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "参数 {option} 需要指定文件名、文件名数字或文件顺序号；使用 --help 查看用法。"
+                ),
+            )
+        })
 }
 
 /// 相对输入路径基于启动命令时的工作目录解析，而非可执行文件所在目录。
@@ -260,6 +389,234 @@ struct Inspection {
     duplicate_count: usize,
     warnings: Vec<String>,
     gaps: Vec<SequenceGap>,
+    recognized_series: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryMatch {
+    FileName,
+    Number,
+    Order,
+    Default,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedBoundary {
+    index: usize,
+    kind: BoundaryMatch,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedRange {
+    start: ResolvedBoundary,
+    end: ResolvedBoundary,
+}
+
+fn normalized_digits(value: &str) -> &str {
+    let normalized = value.trim_start_matches('0');
+    if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    }
+}
+
+fn filename_contains_number(path: &Path, number: &str) -> bool {
+    path.file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|stem| {
+            stem.split(|character: char| !character.is_ascii_digit())
+                .any(|digits| !digits.is_empty() && normalized_digits(digits) == number)
+        })
+}
+
+fn unique_boundary_match(
+    files: &[MediaFile],
+    matches: &[usize],
+    option: &str,
+    value: &str,
+    kind: BoundaryMatch,
+) -> io::Result<Option<ResolvedBoundary>> {
+    match matches {
+        [] => Ok(None),
+        [index] => Ok(Some(ResolvedBoundary {
+            index: *index,
+            kind,
+        })),
+        _ => {
+            let names = matches
+                .iter()
+                .take(6)
+                .map(|index| compact_text(&file_name_display(&files[*index].path), 72))
+                .collect::<Vec<_>>()
+                .join("、");
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "参数 {option}「{}」匹配多个文件（共 {} 个）：{names}{}。请指定完整文件名，不会猜测或改按顺序号匹配。",
+                    compact_text(value, 72),
+                    matches.len(),
+                    if matches.len() > 6 { "等" } else { "" }
+                ),
+            ))
+        }
+    }
+}
+
+fn resolve_boundary(
+    files: &[MediaFile],
+    value: &str,
+    option: &str,
+) -> io::Result<ResolvedBoundary> {
+    let name_matches: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| {
+            file.path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| {
+                    name == value || (cfg!(windows) && name.eq_ignore_ascii_case(value))
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if let Some(boundary) =
+        unique_boundary_match(files, &name_matches, option, value, BoundaryMatch::FileName)?
+    {
+        return Ok(boundary);
+    }
+
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "参数 {option} 的文件名「{}」不在当前目录的有效文件列表中；非纯数字不会按顺序号匹配。",
+                compact_text(value, 72)
+            ),
+        ));
+    }
+    let number = normalized_digits(value);
+    let number_matches: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| filename_contains_number(&file.path, number))
+        .map(|(index, _)| index)
+        .collect();
+    if let Some(boundary) =
+        unique_boundary_match(files, &number_matches, option, value, BoundaryMatch::Number)?
+    {
+        return Ok(boundary);
+    }
+
+    if let Some(position) = number
+        .parse::<usize>()
+        .ok()
+        .filter(|position| *position >= 1 && *position <= files.len())
+    {
+        return Ok(ResolvedBoundary {
+            index: position - 1,
+            kind: BoundaryMatch::Order,
+        });
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "参数 {option}「{}」没有匹配文件名中的完整数字字段，且超出文件顺序范围 1–{}。",
+            compact_text(value, 72),
+            files.len()
+        ),
+    ))
+}
+
+fn resolve_file_range(
+    files: &[MediaFile],
+    start: Option<&str>,
+    end: Option<&str>,
+) -> io::Result<ResolvedRange> {
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "没有有效文件，无法匹配 --start/--end 范围。",
+        ));
+    }
+    let start = start
+        .map(|value| resolve_boundary(files, value, "--start"))
+        .transpose()?
+        .unwrap_or(ResolvedBoundary {
+            index: 0,
+            kind: BoundaryMatch::Default,
+        });
+    let end = end
+        .map(|value| resolve_boundary(files, value, "--end"))
+        .transpose()?
+        .unwrap_or(ResolvedBoundary {
+            index: files.len() - 1,
+            kind: BoundaryMatch::Default,
+        });
+    if start.index > end.index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "起点 {}（第 {} 个）晚于终点 {}（第 {} 个）；范围必须按文件列表顺序从前到后。",
+                file_name_display(&files[start.index].path),
+                start.index + 1,
+                file_name_display(&files[end.index].path),
+                end.index + 1
+            ),
+        ));
+    }
+    if let Some((index, file)) = files.iter().enumerate().find(|(index, file)| {
+        (*index < start.index || *index > end.index) && is_init_file(&file.path)
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "范围排除了初始化片段 {}（第 {} 个），无法保证输出可解码；请将初始化片段包含在范围内，不会自动追加范围外文件。",
+                file_name_display(&file.path),
+                index + 1
+            ),
+        ));
+    }
+    Ok(ResolvedRange { start, end })
+}
+
+fn print_file_range(
+    files: &[MediaFile],
+    range: &ResolvedRange,
+    start: Option<&str>,
+    end: Option<&str>,
+) {
+    println!(
+        "范围选择：原列表 {} 个文件（已排序、去重），本次 {} 个。",
+        files.len(),
+        range.end.index - range.start.index + 1
+    );
+    for (option, value, boundary) in [("--start", start, range.start), ("--end", end, range.end)] {
+        let method = match boundary.kind {
+            BoundaryMatch::FileName => "文件名匹配",
+            BoundaryMatch::Number => "数字匹配（完整字段）",
+            BoundaryMatch::Order => "文件顺序匹配（从 1 开始）",
+            BoundaryMatch::Default => "默认边界",
+        };
+        println!(
+            "  {option} {}：{method} → {}（原列表第 {} 个）",
+            compact_text(value.unwrap_or("未指定"), 72),
+            file_name_display(&files[boundary.index].path),
+            boundary.index + 1
+        );
+    }
+    println!(
+        "  本次文件范围：{} → {}",
+        file_name_display(&files[range.start.index].path),
+        file_name_display(&files[range.end.index].path)
+    );
+}
+
+fn apply_file_range(inspection: &mut Inspection, range: &ResolvedRange) {
+    inspection.files.truncate(range.end.index + 1);
+    inspection.files.drain(..range.start.index);
+    inspection.gaps = find_sequence_gaps(&inspection.files);
 }
 
 #[derive(Clone)]
@@ -429,6 +786,11 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
     files = remove_identical_duplicates(files, &mut warnings)?;
     let duplicate_count = before_dedup - files.len();
     let gaps = find_sequence_gaps(&files);
+    let recognized_series = numbered_series_counts(&files)
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .map(|(key, _)| key.to_string())
+        .collect();
 
     Ok(Inspection {
         candidate_count,
@@ -437,6 +799,7 @@ fn inspect_candidate_files(root: &Path, candidates: Vec<PathBuf>) -> io::Result<
         duplicate_count,
         warnings,
         gaps,
+        recognized_series,
     })
 }
 
@@ -807,12 +1170,7 @@ fn print_inspection(inspection: &Inspection) {
         .iter()
         .filter(|file| file.sequence.is_some())
         .count();
-    let mut series_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for file in &inspection.files {
-        if let (Some(series_key), Some(_)) = (file.series_key.as_deref(), file.sequence) {
-            *series_counts.entry(series_key).or_default() += 1;
-        }
-    }
+    let series_counts = numbered_series_counts(&inspection.files);
     let checked_series_count = series_counts.values().filter(|count| **count >= 2).count();
     if indexed_count < inspection.files.len() {
         println!(
@@ -850,18 +1208,17 @@ fn print_inspection(inspection: &Inspection) {
     }
 }
 
-fn irregular_filename_samples(inspection: &Inspection) -> Vec<PathBuf> {
-    if inspection.files.is_empty() {
-        return Vec::new();
-    }
-
-    let mut series_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for file in &inspection.files {
-        if let (Some(series_key), Some(_)) = (file.series_key.as_deref(), file.sequence) {
-            *series_counts.entry(series_key).or_default() += 1;
+fn numbered_series_counts(files: &[MediaFile]) -> BTreeMap<&str, usize> {
+    let mut counts = BTreeMap::new();
+    for file in files {
+        if let (Some(key), Some(_)) = (file.series_key.as_deref(), file.sequence) {
+            *counts.entry(key).or_default() += 1;
         }
     }
+    counts
+}
 
+fn irregular_filename_samples(inspection: &Inspection) -> Vec<PathBuf> {
     inspection
         .files
         .iter()
@@ -870,9 +1227,7 @@ fn irregular_filename_samples(inspection: &Inspection) -> Vec<PathBuf> {
                 return false;
             }
             match (file.series_key.as_deref(), file.sequence) {
-                (Some(series_key), Some(_)) => {
-                    series_counts.get(series_key).copied().unwrap_or(0) < 2
-                }
+                (Some(series_key), Some(_)) => !inspection.recognized_series.contains(series_key),
                 _ => true,
             }
         })
@@ -2242,6 +2597,207 @@ mod tests {
         ))
     }
 
+    fn range_files(names: &[&str]) -> Vec<super::MediaFile> {
+        names
+            .iter()
+            .map(|name| {
+                let path = PathBuf::from(name);
+                let (sequence, series_key) = super::sequence_details(Path::new("."), &path);
+                super::MediaFile {
+                    path,
+                    size: 1,
+                    sequence,
+                    series_key,
+                    ts_layout: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolves_range_boundaries_by_exact_filename() {
+        let files = range_files(&["切片 201.ts", "切片 202.ts", "切片 203.ts"]);
+        let range =
+            super::resolve_file_range(&files, Some("切片 202.ts"), Some("切片 203.ts")).unwrap();
+        assert_eq!(range.start.index, 1);
+        assert_eq!(range.end.index, 2);
+        assert_eq!(range.start.kind, super::BoundaryMatch::FileName);
+        assert_eq!(range.end.kind, super::BoundaryMatch::FileName);
+        assert!(super::resolve_file_range(&files, Some("切片 202"), None).is_err());
+    }
+
+    #[test]
+    fn resolves_whole_numeric_fields_with_leading_zeros_and_multiple_counters() {
+        let files = range_files(&[
+            "00_002090_index_4_2185.ts",
+            "00_002091_index_4_2186.ts",
+            "00_002092_index_4_2187.ts",
+        ]);
+        let range = super::resolve_file_range(&files, Some("0002091"), Some("002187")).unwrap();
+        assert_eq!(range.start.index, 1);
+        assert_eq!(range.end.index, 2);
+        assert_eq!(range.start.kind, super::BoundaryMatch::Number);
+        assert_eq!(range.end.kind, super::BoundaryMatch::Number);
+    }
+
+    #[test]
+    fn prioritizes_filename_numbers_over_file_order() {
+        let files = range_files(&["segment002.ts", "segment003.ts", "segment004.ts"]);
+        let boundary = super::resolve_boundary(&files, "0002", "--start").unwrap();
+        assert_eq!(boundary.index, 0);
+        assert_eq!(boundary.kind, super::BoundaryMatch::Number);
+
+        let files = range_files(&["002_0002_0002.ts", "003_0003_0003.ts"]);
+        assert_eq!(
+            super::resolve_boundary(&files, "2", "--start")
+                .unwrap()
+                .index,
+            0
+        );
+    }
+
+    #[test]
+    fn falls_back_to_one_based_order_without_matching_numeric_substrings() {
+        let files = range_files(&["segment101.ts", "segment102.ts", "segment103.ts"]);
+        let range = super::resolve_file_range(&files, Some("0001"), Some("0002")).unwrap();
+        assert_eq!(range.start.index, 0);
+        assert_eq!(range.end.index, 1);
+        assert_eq!(range.start.kind, super::BoundaryMatch::Order);
+        assert_eq!(range.end.kind, super::BoundaryMatch::Order);
+        for value in ["0", "4", "10", "1010", "999999999999999999999999999"] {
+            let error = super::resolve_boundary(&files, value, "--start").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("超出文件顺序范围"));
+        }
+        let files = range_files(&["segment201.mp4", "segment202.mp4", "segment203.mp4"]);
+        assert!(super::resolve_boundary(&files, "4", "--start").is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_numeric_matches_instead_of_falling_back_to_order() {
+        let files = range_files(&[
+            "00_002090_index_2_2185.ts",
+            "00_002091_index_2_2186.ts",
+            "00_002092_index_2_2187.ts",
+        ]);
+        let error = super::resolve_boundary(&files, "2", "--start").unwrap_err();
+        assert!(error.to_string().contains("匹配多个文件"));
+        assert!(error.to_string().contains("00_002090_index_2_2185.ts"));
+
+        let files = range_files(&["segment002_count3.ts", "segment003_count4.ts"]);
+        assert!(super::resolve_boundary(&files, "3", "--end").is_err());
+        let files = range_files(&["segment101.m4s", "segment101.decrypt"]);
+        assert!(super::resolve_boundary(&files, "101", "--start").is_err());
+        assert_eq!(
+            super::resolve_boundary(&files, "segment101.decrypt", "--start")
+                .unwrap()
+                .index,
+            1
+        );
+    }
+
+    #[test]
+    fn numeric_range_matching_handles_zero_and_values_larger_than_u64() {
+        let files = range_files(&["0000.ts", "999999999999999999999999999.ts"]);
+        assert_eq!(
+            super::resolve_boundary(&files, "00", "--start")
+                .unwrap()
+                .index,
+            0
+        );
+        assert_eq!(
+            super::resolve_boundary(&files, "000999999999999999999999999999", "--end")
+                .unwrap()
+                .index,
+            1
+        );
+    }
+
+    #[test]
+    fn validates_range_order_and_supports_open_or_single_file_ranges() {
+        let files = range_files(&["segment101.ts", "segment102.ts", "segment103.ts"]);
+        let range = super::resolve_file_range(&files, None, Some("102")).unwrap();
+        assert_eq!(range.start.index, 0);
+        assert_eq!(range.start.kind, super::BoundaryMatch::Default);
+        assert_eq!(range.end.index, 1);
+        let range = super::resolve_file_range(&files, Some("102"), None).unwrap();
+        assert_eq!(range.end.index, 2);
+        assert_eq!(range.end.kind, super::BoundaryMatch::Default);
+        let range = super::resolve_file_range(&files, Some("102"), Some("segment102.ts")).unwrap();
+        assert_eq!(range.start.index, range.end.index);
+        let error = super::resolve_file_range(&files, Some("103"), Some("101")).unwrap_err();
+        assert!(error.to_string().contains("晚于终点"));
+        assert!(super::resolve_file_range(&files, Some("missing.ts"), None).is_err());
+        assert!(super::resolve_file_range(&[], Some("1"), None).is_err());
+    }
+
+    #[test]
+    fn range_selection_rechecks_gaps_and_preserves_known_filename_patterns() {
+        let files = range_files(&["segment101.ts", "segment103.ts", "segment104.ts"]);
+        let recognized_series = super::numbered_series_counts(&files)
+            .into_keys()
+            .map(str::to_string)
+            .collect();
+        let gaps = super::find_sequence_gaps(&files);
+        let mut inspection = super::Inspection {
+            candidate_count: files.len(),
+            files,
+            skipped_typescript: Vec::new(),
+            duplicate_count: 0,
+            warnings: Vec::new(),
+            gaps,
+            recognized_series,
+        };
+        assert_eq!(inspection.gaps.len(), 1);
+        let range = super::resolve_file_range(&inspection.files, Some("103"), Some("104")).unwrap();
+        super::apply_file_range(&mut inspection, &range);
+        assert_eq!(inspection.files.len(), 2);
+        assert!(inspection.gaps.is_empty());
+        let range = super::resolve_file_range(&inspection.files, Some("104"), None).unwrap();
+        super::apply_file_range(&mut inspection, &range);
+        assert_eq!(inspection.files.len(), 1);
+        assert!(irregular_filename_samples(&inspection).is_empty());
+        assert_eq!(inspection.candidate_count, 3);
+    }
+
+    #[test]
+    fn refuses_to_drop_initialization_fragments_from_a_selected_range() {
+        let files = range_files(&["init.mp4", "segment201.m4s", "segment202.m4s"]);
+        let error = super::resolve_file_range(&files, Some("201"), Some("202")).unwrap_err();
+        assert!(error.to_string().contains("排除了初始化片段"));
+        assert!(super::resolve_file_range(&files, Some("init.mp4"), Some("202")).is_ok());
+    }
+
+    #[test]
+    fn parses_start_and_end_options_and_rejects_missing_values() {
+        let options = parse_args([
+            "--start".to_string(),
+            "切片 201.ts".to_string(),
+            "--end=000203".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(options.start.as_deref(), Some("切片 201.ts"));
+        assert_eq!(options.end.as_deref(), Some("000203"));
+        let options = parse_args([
+            "--start=2".to_string(),
+            "--end".to_string(),
+            "3".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(options.start.as_deref(), Some("2"));
+        assert_eq!(options.end.as_deref(), Some("3"));
+        for args in [
+            vec!["--start"],
+            vec!["--end"],
+            vec!["--start", ""],
+            vec!["--end="],
+            vec!["--start="],
+            vec!["--start", "--end", "3"],
+        ] {
+            assert!(parse_args(args.into_iter().map(str::to_string)).is_err());
+        }
+    }
+
     fn series_count(inspection: &super::Inspection) -> usize {
         inspection
             .files
@@ -2516,6 +3072,20 @@ format.duration="2.000000""#,
         assert_eq!(files, vec![root.join("part1.ts")]);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_help_and_version_flags_without_requiring_input_options() {
+        for flag in ["-h", "--help"] {
+            let options = parse_args([flag.to_string(), "--input-dir".to_string()]).unwrap();
+            assert!(options.show_help);
+            assert!(!options.show_version);
+        }
+        for flag in ["-V", "--version"] {
+            let options = parse_args([flag.to_string(), "--input-dir".to_string()]).unwrap();
+            assert!(options.show_version);
+            assert!(!options.show_help);
+        }
     }
 
     #[test]

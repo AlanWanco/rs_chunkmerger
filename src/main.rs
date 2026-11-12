@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
@@ -12,7 +14,22 @@ use std::thread;
 use natord::compare;
 use walkdir::{DirEntry, WalkDir};
 
+mod gui;
+mod gui_backend;
+
 fn main() -> io::Result<()> {
+    if env::args_os().len() == 1 {
+        return gui::run().map_err(|error| io::Error::other(error.to_string()));
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // Keep a single GUI-subsystem executable while exposing CLI output to its parent terminal.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        AttachConsole(u32::MAX);
+    }
     let options = parse_args(env::args().skip(1))?;
     let version = env!("CARGO_PKG_VERSION");
     if options.show_help {
@@ -230,6 +247,7 @@ fn print_help(version: &str) {
       --ts                输出 TS，不转换为 MP4
 
 说明：
+  无参数打开深色 GUI；带参数进入 CLI。扫描当前目录请使用 rcm --this-dir。
   默认扫描启动命令时的工作目录，而非程序所在目录；默认不扫描子目录。
   普通分片默认尝试用 FFmpeg 转为 MP4；未找到 FFmpeg 时保留 TS。
   独立音视频分轨需要 FFmpeg 和 ffprobe，使用 --ts 时也不例外。
@@ -243,7 +261,7 @@ fn print_help(version: &str) {
   使用 --recursive 时，各目录分别解析同一组范围；任一目录无效则停止。
 
 示例：
-  rcm
+  rcm --this-dir
   rcm --input-dir "路径/分片"
   rcm --this-dir --recursive --ts
   rcm --start "segment001.ts" --end "segment050.ts"

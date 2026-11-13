@@ -2,7 +2,7 @@ use crate::gui_backend::{self, GuiPlan, GuiRequest};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable;
 use gpui_kit::component::{
-    Root, Theme, ThemeMode,
+    Icon, Root, Sizable, Theme, ThemeMode,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -59,6 +59,19 @@ fn toggle(
         .label(label)
         .disabled(busy);
     if active { button.primary() } else { button }
+}
+
+/// Section labels share one mark: a slim accent rule, the section's icon, then
+/// the label. The rule is what separates sections at a glance; the icon names
+/// the kind of content under it.
+fn section_label(label: &'static str, icon: IconName) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(div().w(px(2.)).h(px(16.)).bg(rgb(0x87b4fa)))
+        .child(Icon::new(icon).text_color(rgb(0x87b4fa)).with_size(px(16.)))
+        .child(label)
 }
 
 struct Merger {
@@ -347,10 +360,9 @@ impl Render for Merger {
                     .border_b_1()
                     .border_color(rgb(0x303641))
                     .child(
-                        div()
+                        section_label("分片合并", IconName::Combine)
                             .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("分片合并"),
+                            .font_weight(FontWeight::SEMIBOLD),
                     )
                     .child(
                         div()
@@ -468,7 +480,7 @@ impl Render for Merger {
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child("起始分片")
+                                    .child(section_label("起始分片", IconName::ChevronsLeft))
                                     .child(
                                         Input::new(&self.start).rounded_xl().disabled(self.busy),
                                     ),
@@ -479,7 +491,7 @@ impl Render for Merger {
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child("结束分片")
+                                    .child(section_label("结束分片", IconName::ChevronsRight))
                                     .child(Input::new(&self.end).rounded_xl().disabled(self.busy)),
                             ),
                     )
@@ -561,7 +573,7 @@ impl Render for Merger {
                                 div()
                                     .mb_3()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("文件预览"),
+                                    .child(section_label("文件预览", IconName::List)),
                             )
                             .child(preview),
                     ),

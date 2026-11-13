@@ -1,5 +1,6 @@
 use crate::gui_backend::{self, GuiPlan, GuiRequest};
-use gpui_kit::base::{Disableable, Selectable};
+use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable;
 use gpui_kit::component::{
     Root, Theme, ThemeMode,
     button::{Button, ButtonVariants},
@@ -41,6 +42,23 @@ fn clipboard_paths(item: &ClipboardItem) -> Vec<PathBuf> {
         .into_iter()
         .filter(|p| p.exists())
         .collect()
+}
+
+/// Toggle pills carry their state in the fill, not just a subtle tint: an
+/// active option is filled with the accent, an inactive one stays neutral.
+fn toggle(
+    id: &'static str,
+    label: &'static str,
+    icon: IconName,
+    active: bool,
+    busy: bool,
+) -> Button {
+    let button = Button::new(id)
+        .rounded_full()
+        .icon(icon)
+        .label(label)
+        .disabled(busy);
+    if active { button.primary() } else { button }
 }
 
 struct Merger {
@@ -473,65 +491,65 @@ impl Render for Merger {
                             .flex_wrap()
                             .child(div().mr_1().text_color(rgb(0xb6bfce)).child("输出"))
                             .child(
-                                Button::new("mp4")
-                                    .rounded_full()
-                                    .icon(gpui_kit::assets::IconName::Video)
-                                    .label("MP4")
-                                    .selected(!self.ts)
-                                    .disabled(self.busy)
+                                toggle("mp4", "MP4", IconName::Video, !self.ts, self.busy)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.ts = false;
                                         this.invalidate(cx);
                                     })),
                             )
                             .child(
-                                Button::new("ts")
-                                    .rounded_full()
-                                    .icon(gpui_kit::assets::IconName::File)
-                                    .label("TS")
-                                    .selected(self.ts)
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                toggle("ts", "TS", IconName::File, self.ts, self.busy).on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.ts = true;
                                         this.invalidate(cx);
-                                    })),
+                                    }),
+                                ),
                             )
                             .child(div().mx_2().w_px().h_5().bg(rgb(0x303641)))
                             .child(
-                                Button::new("recursive")
-                                    .rounded_full()
-                                    .icon(gpui_kit::assets::IconName::Folder)
-                                    .label("递归子目录")
-                                    .selected(self.recursive)
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                toggle(
+                                    "recursive",
+                                    "递归子目录",
+                                    IconName::Folder,
+                                    self.recursive,
+                                    self.busy,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.recursive = !this.recursive;
                                         this.invalidate(cx);
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
-                                Button::new("hidden")
-                                    .rounded_full()
-                                    .icon(gpui_kit::assets::IconName::Eye)
-                                    .label("包含隐藏文件")
-                                    .selected(self.hidden)
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                toggle(
+                                    "hidden",
+                                    "包含隐藏文件",
+                                    IconName::Eye,
+                                    self.hidden,
+                                    self.busy,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.hidden = !this.hidden;
                                         this.invalidate(cx);
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
-                                Button::new("split")
-                                    .rounded_full()
-                                    .icon(gpui_kit::assets::IconName::Scissors)
-                                    .label("缺片处拆分")
-                                    .selected(self.split)
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                toggle(
+                                    "split",
+                                    "缺片处拆分",
+                                    IconName::Scissors,
+                                    self.split,
+                                    self.busy,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.split = !this.split;
                                         this.invalidate(cx);
-                                    })),
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -653,6 +671,14 @@ pub fn run() -> anyhow::Result<()> {
             theme.button_primary_foreground = theme.primary_foreground;
             theme.button_primary_hover = theme.primary_hover;
             theme.button_primary_active = theme.primary_active;
+            // Buttons resolve the component token set, which is a separate
+            // snapshot from the legacy fields above; leave it stale and every
+            // primary/active pill renders in the stock near-white accent.
+            theme.tokens.primary = theme.primary.into();
+            theme.tokens.button_primary = theme.button_primary.into();
+            theme.tokens.button_primary_hover = theme.button_primary_hover.into();
+            theme.tokens.button_primary_active = theme.button_primary_active.into();
+            theme.tokens.button_primary_foreground = theme.button_primary_foreground.into();
             Theme::sync_base(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {

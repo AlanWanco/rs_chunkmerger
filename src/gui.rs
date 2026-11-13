@@ -615,11 +615,33 @@ impl Render for Merger {
             )
     }
 }
+
+#[cfg(target_os = "macos")]
+fn install_application_icon() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    const ICON: &[u8] = include_bytes!("../assets/icon.png");
+    let Some(market) = MainThreadMarker::new() else {
+        return;
+    };
+    let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON));
+    if let Some(image) = image {
+        unsafe {
+            NSApplication::sharedApplication(market).setApplicationIconImage(Some(&image));
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_application_icon() {}
 pub fn run() -> anyhow::Result<()> {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             gpui_kit::init(cx);
+            install_application_icon();
             Theme::change(ThemeMode::Dark, None, cx);
             let theme = Theme::global_mut(cx);
             theme.primary = rgb(0x87b4fa).into();
@@ -673,5 +695,14 @@ mod tests {
             parse_paths("file:///tmp/a%20b.ts\n/tmp/c.ts"),
             vec![PathBuf::from("/tmp/a b.ts"), PathBuf::from("/tmp/c.ts")]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_icon_is_a_1024_square_png() {
+        let icon = include_bytes!("../assets/icon.png");
+        assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(u32::from_be_bytes(icon[16..20].try_into().unwrap()), 1024);
+        assert_eq!(u32::from_be_bytes(icon[20..24].try_into().unwrap()), 1024);
     }
 }

@@ -2,3 +2,4 @@
 /src/main.exe
 /src/main.pdb
 .DS_Store
+/dist

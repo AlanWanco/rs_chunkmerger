@@ -48,6 +48,14 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         shell: bash
 
+      - name: Bundle macOS app
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x scripts/bundle-macos.sh
+          ./scripts/bundle-macos.sh "target/${{ matrix.target }}/release/rs_chunkmerger" dist/rcm.app
+          ditto -c -k --sequesterRsrc --keepParent dist/rcm.app rs_chunkmerger-macos-arm64.app.zip
+        shell: bash
+
       - name: Rename artifact
         run: |
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
@@ -61,7 +69,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: artifact-${{ matrix.target }}
-          path: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            rs_chunkmerger-macos-arm64.app.zip
+          if-no-files-found: ignore
 
   release:
     name: Create Release
@@ -81,6 +92,7 @@ jobs:
           files: |
             rs_chunkmerger-windows-amd64.exe
             rs_chunkmerger-macos-arm64
+            rs_chunkmerger-macos-arm64.app.zip
             rs_chunkmerger-linux-amd64
             rs_chunkmerger-linux-arm64
         env:

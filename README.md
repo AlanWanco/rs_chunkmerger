@@ -26,6 +26,16 @@
 ### 从 Release 下载
 前往 [Releases](https://github.com/your-username/rs_chunkmerger/releases) 页面下载适用于您系统的预编译二进制文件。
 
+macOS 另有一个 `rs_chunkmerger-macos-arm64.app.zip`：解压得到 `rcm.app`，拖进「应用程序」即可双击启动 GUI，不会弹出终端窗口。裸二进制双击则由「终端」代为运行，属于系统行为。
+
+也可以本地打包：
+
+```bash
+cargo build --release
+./scripts/bundle-macos.sh          # 生成 dist/rcm.app
+cp -R dist/rcm.app ~/Applications/
+```
+
 ### 自行编译
 确保已安装 [Rustup](https://rustup.rs/)；仓库固定 Rust 1.95.0（GPUI 依赖要求），然后运行：
 

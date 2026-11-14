@@ -10,10 +10,18 @@ pub struct GuiRequest {
     pub split_gaps: bool,
 }
 
+pub struct PreviewRow {
+    pub name: String,
+    pub size: u64,
+}
+
 pub struct GuiPlan {
     pub summary: Vec<String>,
-    pub files: Vec<String>,
+    pub files: Vec<PreviewRow>,
     pub outputs: Vec<PathBuf>,
+    /// Only a single concatenation group can be reordered; audio/video muxing
+    /// and split outputs carry an order that the preview must not contradict.
+    pub reorderable: bool,
     actions: Vec<DirectoryAction>,
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
@@ -57,6 +65,7 @@ pub fn prepare(request: GuiRequest) -> io::Result<GuiPlan> {
         summary: vec![],
         files: vec![],
         outputs: vec![],
+        reorderable: false,
         actions: vec![],
         ffmpeg,
         ffprobe,
@@ -110,12 +119,11 @@ pub fn prepare(request: GuiRequest) -> io::Result<GuiPlan> {
             plan.summary
                 .push("文件名规律不足，请核对下方完整文件列表。".into());
         }
-        plan.files.extend(
-            inspection
-                .files
-                .iter()
-                .map(|f| f.path.display().to_string()),
-        );
+        plan.files
+            .extend(inspection.files.iter().map(|f| PreviewRow {
+                name: file_name_display(&f.path),
+                size: f.size,
+            }));
         let action = match assess_audio_video_tracks(&inspection, plan.ffprobe.as_deref()) {
             AvAssessment::Unsafe(reason) => return Err(io::Error::other(reason)),
             AvAssessment::Pair(pair) => {
@@ -168,7 +176,30 @@ pub fn prepare(request: GuiRequest) -> io::Result<GuiPlan> {
     for path in &plan.outputs {
         reject_existing(path)?;
     }
+    plan.reorderable = plan.actions.len() == 1
+        && matches!(
+            plan.actions.first(),
+            Some(DirectoryAction::Concatenate { groups, .. })
+                if groups.len() == 1 && groups[0].len() == plan.files.len()
+        );
     Ok(plan)
+}
+
+impl GuiPlan {
+    /// Swaps two preview rows together with the merge order, so the table keeps
+    /// telling the truth about what will be written.
+    pub fn move_row(&mut self, from: usize, to: usize) -> bool {
+        if !self.reorderable || from == to || from >= self.files.len() || to >= self.files.len() {
+            return false;
+        }
+        self.files.swap(from, to);
+        if let Some(DirectoryAction::Concatenate { groups, .. }) = self.actions.first_mut()
+            && let Some(group) = groups.first_mut()
+        {
+            group.swap(from, to);
+        }
+        true
+    }
 }
 
 fn reject_existing(path: &Path) -> io::Result<()> {
@@ -270,7 +301,12 @@ mod tests {
         };
         let plan = prepare(request()).unwrap();
         assert_eq!(plan.files.len(), 2);
-        assert!(!plan.files.iter().any(|p| p.ends_with("segment202.m4s")));
+        assert!(
+            !plan
+                .files
+                .iter()
+                .any(|row| row.name.ends_with("segment202.m4s"))
+        );
         let paths = execute(plan).unwrap();
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"firstlast");
         assert_eq!(
@@ -278,6 +314,47 @@ mod tests {
             b"excluded"
         );
         assert!(prepare(request()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reordering_rows_reorders_the_merged_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "rcm-gui-reorder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let input = root.join("chunks");
+        std::fs::create_dir_all(&input).unwrap();
+        for (name, bytes) in [
+            ("segment101.m4s", b"one".as_slice()),
+            ("segment102.m4s", b"two"),
+            ("segment103.m4s", b"three"),
+        ] {
+            std::fs::write(input.join(name), bytes).unwrap();
+        }
+        let plan_request = || GuiRequest {
+            paths: vec![input.clone()],
+            start: None,
+            end: None,
+            ts: true,
+            recursive: false,
+            include_hidden: false,
+            split_gaps: false,
+        };
+        let mut plan = prepare(plan_request()).unwrap();
+        assert!(plan.reorderable);
+        assert_eq!(plan.files[0].name, "segment101.m4s");
+        assert!(plan.move_row(0, 2));
+        assert_eq!(plan.files[0].name, "segment103.m4s");
+        assert_eq!(plan.files[1].name, "segment102.m4s");
+        assert_eq!(plan.files[2].name, "segment101.m4s");
+        assert!(!plan.move_row(0, 9));
+        let outputs = execute(plan).unwrap();
+        assert_eq!(std::fs::read(&outputs[0]).unwrap(), b"threetwoone");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,3 +1,4 @@
+use crate::format_bytes;
 use crate::gui_backend::{self, GuiPlan, GuiRequest};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable;
@@ -151,6 +152,17 @@ impl Merger {
             subscriptions,
         }
     }
+    fn move_row(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(plan) = self.plan.as_mut() else {
+            return;
+        };
+        if plan.move_row(from, to) {
+            self.message = "已调整合并顺序；输出文件名保持检测时的边界不变。".into();
+            self.error = false;
+            cx.notify();
+        }
+    }
+
     fn invalidate(&mut self, cx: &mut Context<Self>) {
         self.plan = None;
         self.error = false;
@@ -300,6 +312,7 @@ impl Render for Merger {
             let _ = weak.update(cx, |this, cx| this.import(paths, window, cx));
             true
         };
+        let reorderable = self.plan.as_ref().is_some_and(|plan| plan.reorderable) && !self.busy;
         let mut preview = div().flex().flex_col().gap_2();
         if let Some(plan) = &self.plan {
             preview = preview
@@ -325,10 +338,67 @@ impl Render for Merger {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("合并顺序"),
                 )
-                .children(plan.files.iter().enumerate().map(|(i, p)| {
+                .child(
                     div()
-                        .text_color(rgb(0xb6bfce))
-                        .child(format!("{}   {}", i + 1, p))
+                        .flex()
+                        .gap_2()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x303641))
+                        .text_xs()
+                        .text_color(rgb(0x8d99ab))
+                        .child(div().w(px(32.)).child("#"))
+                        .child(div().flex_1().child("文件"))
+                        .child(div().w(px(88.)).child("大小"))
+                        .when(reorderable, |row| row.child(div().w(px(56.)))),
+                )
+                .children(plan.files.iter().enumerate().map(|(index, row)| {
+                    let up = cx.listener(move |this: &mut Merger, _, _, cx| {
+                        this.move_row(index, index.saturating_sub(1), cx);
+                    });
+                    let down = cx.listener(move |this: &mut Merger, _, _, cx| {
+                        this.move_row(index, index + 1, cx);
+                    });
+                    let is_first = index == 0;
+                    let is_last = index + 1 == plan.files.len();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1p5()
+                        .border_b_1()
+                        .border_color(rgb(0x262c36))
+                        .child(
+                            div()
+                                .w(px(32.))
+                                .text_color(rgb(0x8d99ab))
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(row.name.clone()))
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .text_color(rgb(0x8d99ab))
+                                .child(format_bytes(row.size)),
+                        )
+                        .when(reorderable, |line| {
+                            line.child(
+                                Button::new(format!("up-{index}"))
+                                    .rounded_full()
+                                    .label("上移")
+                                    .with_size(px(26.))
+                                    .disabled(is_first)
+                                    .on_click(up),
+                            )
+                            .child(
+                                Button::new(format!("down-{index}"))
+                                    .rounded_full()
+                                    .label("下移")
+                                    .with_size(px(26.))
+                                    .disabled(is_last)
+                                    .on_click(down),
+                            )
+                        })
                 }));
         } else if !self.imported.is_empty() {
             preview = preview

@@ -146,7 +146,7 @@ impl Merger {
             split: true,
             plan: None,
             busy: false,
-            message: "导入分片后，先检测并核对合并范围。".into(),
+            message: "导入分片后，先检查并核对合并范围。".into(),
             error: false,
             clipboard_count: 0,
             subscriptions,
@@ -157,7 +157,7 @@ impl Merger {
             return;
         };
         if plan.move_row(from, to) {
-            self.message = "已调整合并顺序；输出文件名保持检测时的边界不变。".into();
+            self.message = "已调整合并顺序；输出文件名保持检查时的边界不变。".into();
             self.error = false;
             cx.notify();
         }
@@ -166,7 +166,7 @@ impl Merger {
     fn invalidate(&mut self, cx: &mut Context<Self>) {
         self.plan = None;
         self.error = false;
-        self.message = "输入已更新，请重新检测。".into();
+        self.message = "输入已更新，请重新检查。".into();
         cx.notify();
     }
     fn import(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
@@ -234,7 +234,7 @@ impl Merger {
         self.busy = true;
         self.plan = None;
         self.error = false;
-        self.message = "正在检测文件、编号与音视频轨…".into();
+        self.message = "正在检查文件、编号与音视频轨…".into();
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = cx
@@ -246,7 +246,7 @@ impl Merger {
                 match result {
                     Ok(plan) => {
                         this.message = format!(
-                            "检测完成 · {} 个文件，{} 个输出。核对列表后确认合并。",
+                            "检查完成 · {} 个文件，{} 个输出。核对列表后确认合并。",
                             plan.files.len(),
                             plan.outputs.len()
                         );
@@ -697,7 +697,7 @@ impl Render for Merger {
                                     .label(if self.busy {
                                         "处理中…"
                                     } else {
-                                        "检测文件"
+                                        "检查导入"
                                     })
                                     .disabled(self.busy)
                                     .on_click(cx.listener(|this, _, _, cx| this.detect(cx))),
